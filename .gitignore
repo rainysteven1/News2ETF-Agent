@@ -1,0 +1,30 @@
+# LLM credentials (contains sensitive API keys)
+configs/llm_credentials.yaml
+
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+.env*
+
+.claude/
+.vscode/
+
+checkpoints/
+data/
+!experiments/
+experiments/*
+!experiments/metadata/
+logs/
+wandb/
+
+news2etf_swagger.json
+
+alembic/versions/*_auto.py

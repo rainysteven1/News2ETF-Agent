@@ -1,0 +1,31 @@
+[agent]
+llm_model = "Minimax-M2.7-highspeed"
+llm_temperature = 0.1
+max_weight_per_industry = 0.3
+max_total_weight = 1.0
+
+[backtest]
+initial_capital = 1_000_000.0
+transaction_fee = 0.0003
+slippage = 0.0005
+risk_free_rate = 0.03
+
+[data]
+# Raw input: news articles (merged from part1 + part2)
+input_news_raw = "data/converted/tushare_news_2021_today_merged.parquet"
+# Raw input: ETF price history (Code, trade_dt, close)
+etf_prices = "data/converted/主题ETF历史量价.parquet"
+# ETF metadata: code, name, tracking_index, aum
+etf_info = "data/converted/主题ETF信息表-快照1_主题ETF.parquet"
+# Industry taxonomy with beta + correlation metadata
+industry_dict = "data/industry_dict.json"
+
+output_sentiment = "data/industry_sentiment.parquet"
+output_signals = "data/ml_signals.parquet"
+output_trades = "data/trade_signals.parquet"
+output_logs = "data/decision_logs.jsonl"
+output_backtest = "data/backtest_results.parquet"
+output_weekly_returns = "data/weekly_returns.parquet"
+
+start_date = "2021-01-01"
+end_date = "2024-12-31"

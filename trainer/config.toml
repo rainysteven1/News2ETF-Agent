@@ -1,0 +1,58 @@
+# Trainer configuration — used by both signals (LSTM) and FinBERT pipelines.
+# All data paths are relative to the project root.
+
+[signals.model]
+sequence_length = 5
+hidden_size = 64
+num_layers = 2
+dropout = 0.2
+
+[signals.training]
+epochs_pretrain = 15
+epochs_finetune = 10
+batch_size = 64
+lr = 0.001
+num_heads = 4
+anomaly_threshold = 0.03
+
+[signals.isolation_forest]
+contamination = 0.1
+n_estimators = 100
+
+[signals.lightgbm]
+num_leaves = 31
+learning_rate = 0.05
+n_estimators = 200
+
+[finbert.model]
+pretrained_model = "./data/pretrained_models/Erlangshen-Roberta-110M-Sentiment"
+num_level1 = 8
+num_sentiment = 3
+max_seq_length = 128
+dropout = 0.1
+
+[finbert.training]
+batch_size = 64
+epochs_phase1 = 3
+epochs_phase2 = 5
+bert_lr = 2e-5
+heads_lr = 1e-4
+weight_decay = 0.01
+warmup_ratio = 0.1
+grad_accum_steps = 1
+max_grad_norm = 1.0
+fp16 = true
+seed = 42
+use_content = false
+
+[setfit.model]
+pretrained_model = "./data/pretrained_models/text2vec-base-chinese "
+
+[setfit.training]
+test_size = 0.2
+seed = 42
+batch_size = 16
+num_iterations = 20
+num_epochs = 1
+learning_rate = 2e-5
+min_samples_per_class = 2
