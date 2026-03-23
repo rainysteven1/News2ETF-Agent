@@ -136,11 +136,11 @@ def train_setfit_for_major(
 
 
 def train_per_major(
-    data_path: Path,
+    data_path: Path | None = None,
     output_dir: Path | None = None,
     model_config: Any | None = None,
     training_config: Any | None = None,
-    wandb_project: str = "news2etf",
+    wandb_project: str | None = None,
 ) -> dict[str, dict[str, Any]]:
     """Train one SetFit model per major category.
 
@@ -152,7 +152,16 @@ def train_per_major(
     mcfg = model_config or cfg.setfit
     tcfg = training_config or cfg.setfit_training
 
+    if data_path is None:
+        if tcfg.raw_data_path is None:
+            raise ValueError(
+                "data_path must be provided either as argument or via "
+                "config.toml [setfit.training] raw_data_path"
+            )
+        data_path = tcfg.raw_data_path
+
     output_dir = output_dir or Path("checkpoints/setfit")
+    wb_project = wandb_project or cfg.wandb.project
     output_dir.mkdir(parents=True, exist_ok=True)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -168,7 +177,8 @@ def train_per_major(
         from trainer.wandb_handler import WandbHandler
 
         wb = WandbHandler(
-            project=wandb_project,
+            project=wb_project,
+            entity=cfg.wandb.entity,
             name=major,
             config_dict={
                 "pretrained_model": mcfg.pretrained_model,
@@ -178,6 +188,7 @@ def train_per_major(
                 "learning_rate": tcfg.learning_rate,
             },
             tags=["setfit", major],
+            mode=cfg.wandb.mode,
         )
 
         result = train_setfit_for_major(df, major, output_dir, mcfg, tcfg, device, wb)

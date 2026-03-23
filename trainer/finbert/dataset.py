@@ -22,14 +22,14 @@ from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
 
 L1_CATEGORIES: list[str] = [
-    "科技信息",
-    "高端制造",
+    "主题策略",
     "医药健康",
-    "消费服务",
+    "基础设施/公共",
+    "消费文娱",
+    "科技信息",
+    "资源材料",
     "金融地产",
-    "能源材料",
-    "交通运输",
-    "军工安全",
+    "高端制造",
 ]
 
 L1_TO_IDX: dict[str, int] = {name: i for i, name in enumerate(L1_CATEGORIES)}
@@ -102,18 +102,13 @@ class NewsClassificationDataset(Dataset):
         self._validate(df)
 
         self.titles = df["title"].to_list()
-        self.contents = (
-            df["content"].to_list() if use_content and "content" in df.columns else None
-        )
+        self.contents = df["content"].to_list() if use_content and "content" in df.columns else None
 
         raw_l1 = df["major_category"].to_list()
         self.l1_labels = [self.l1_to_idx[str(v)] for v in raw_l1]
 
         raw_sentiment = df["sentiment"].to_list()
-        self.sentiment_labels = [
-            SENTIMENT_STR_TO_INT[s] if isinstance(s, str) else int(s)
-            for s in raw_sentiment
-        ]
+        self.sentiment_labels = [SENTIMENT_STR_TO_INT[s] if isinstance(s, str) else int(s) for s in raw_sentiment]
 
     @staticmethod
     def _validate(df: pl.DataFrame) -> None:
@@ -142,9 +137,7 @@ class NewsClassificationDataset(Dataset):
 
         input_ids = cast(torch.Tensor, encoding["input_ids"])
         attention_mask = cast(torch.Tensor, encoding["attention_mask"])
-        token_type_ids = cast(
-            torch.Tensor, encoding.get("token_type_ids", torch.zeros_like(input_ids))
-        )
+        token_type_ids = cast(torch.Tensor, encoding.get("token_type_ids", torch.zeros_like(input_ids)))
 
         return {
             "input_ids": input_ids.squeeze(0),
@@ -173,9 +166,7 @@ class NewsInferenceDataset(Dataset):
             raise ValueError("Parquet file must contain a 'title' column")
 
         self.titles = df["title"].to_list()
-        self.contents = (
-            df["content"].to_list() if use_content and "content" in df.columns else None
-        )
+        self.contents = df["content"].to_list() if use_content and "content" in df.columns else None
         self.meta = df
 
     def __len__(self) -> int:
@@ -198,9 +189,7 @@ class NewsInferenceDataset(Dataset):
 
         input_ids = cast(torch.Tensor, encoding["input_ids"])
         attention_mask = cast(torch.Tensor, encoding["attention_mask"])
-        token_type_ids = cast(
-            torch.Tensor, encoding.get("token_type_ids", torch.zeros_like(input_ids))
-        )
+        token_type_ids = cast(torch.Tensor, encoding.get("token_type_ids", torch.zeros_like(input_ids)))
 
         return {
             "input_ids": input_ids.squeeze(0),

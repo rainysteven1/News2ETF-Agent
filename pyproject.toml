@@ -20,7 +20,7 @@ dependencies = [
     "lightgbm>=4.6.0",
     "scikit-learn>=1.8.0",
     "wandb>=0.25.1",
-    "transformers==4.38.2",
+    "transformers==4.38.1",
     "datasets>=4.8.3",
 ]
 

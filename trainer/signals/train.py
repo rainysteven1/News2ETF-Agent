@@ -263,17 +263,19 @@ def train_lgbm_stacking(
 
 def run_training(
     config_path: str | None = None,
-    wandb_project: str = "news2etf",
+    wandb_project: str | None = None,
     wandb_name: str | None = None,
 ) -> dict[str, str]:
     """Full pipeline: pretrain → finetune → LightGBM stacking."""
     cfg = load_config(config_path)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     wb = WandbHandler(
-        project=wandb_project,
-        name=wandb_name or f"etf-train-{datetime.now():%m%d-%H%M}",
+        project=wandb_project or cfg.wandb.project,
+        entity=cfg.wandb.entity,
+        name=wandb_name or cfg.wandb.name or f"etf-train-{datetime.now():%m%d-%H%M}",
         config=cfg,
         tags=["signals"],
+        mode=cfg.wandb.mode,
     )
 
     logger.info(f"[Train] Device: {device}")

@@ -4,9 +4,9 @@ from trainer.finbert.dataset import (
     IDX_TO_L1,
     L1_CATEGORIES,
     L1_TO_IDX,
+    SENTIMENT_LABELS,
     NewsClassificationDataset,
     NewsInferenceDataset,
-    SENTIMENT_LABELS,
     preprocess_split,
 )
 from trainer.finbert.model import FinBERTClassifier, FinBERTClassifierConfig, load_finbert_classifier

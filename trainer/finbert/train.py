@@ -147,33 +147,38 @@ def unfreeze_bert(model: FinBERTClassifier) -> None:
 # ─── Main training function ───────────────────────────────────────────────────
 
 
-def train_finbert(
-    data_path: Path,
-    output_dir: Path | None = None,
-    model_config: FinBERTModelConfig | None = None,
-    training_config: FinBERTTrainingConfig | None = None,
-    wandb_project: str = "news2etf",
-    wandb_name: str | None = None,
-    config_path: str | Path | None = None,
-) -> dict[str, Path]:
+def train_finbert() -> dict[str, Path]:
     """Train FinBERT on labeled news data.
 
-    Returns dict of saved checkpoint paths.
+    Returns dict with paths to best checkpoint and ONNX model.
     """
     from trainer.config import load_config as load_trainer_config
 
-    cfg = load_trainer_config(config_path) if config_path else TrainerConfig()
+    cfg = load_trainer_config()
 
-    mcfg = model_config or cfg.finbert
-    tcfg = training_config or cfg.finbert_training
+    mcfg = cfg.finbert
+    tcfg = cfg.finbert_training
+    wcfg = cfg.wandb
+
+    if tcfg.raw_data_path is None:
+        raise ValueError("raw_data_path must be set via config.toml [finbert.training] raw_data_path")
 
     set_seed(tcfg.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info(f"[FinBERT] Device: {device}")
 
+    # Generate run name early so we can use it for the output directory
+    # (matches WandbHandler's auto-naming convention)
+    run_name = f"finbert-{datetime.now():%m%d-%H%M}"
+    run_output_dir = (
+        Path(tcfg.output_dir) / run_name if tcfg.output_dir else Path("trainer/checkpoints/finbert") / run_name
+    )
+    run_output_dir.mkdir(parents=True, exist_ok=True)
+
     wb = WandbHandler(
-        project=wandb_project,
-        name=wandb_name or f"finbert-{datetime.now():%m%d-%H%M}",
+        project=wcfg.project,
+        entity=wcfg.entity,
+        name=run_name,
         config_dict={
             "pretrained_model": mcfg.pretrained_model,
             "num_level1": mcfg.num_level1,
@@ -187,23 +192,21 @@ def train_finbert(
             "epochs_phase2": tcfg.epochs_phase2,
         },
         tags=["finbert"],
+        mode=wcfg.mode,
     )
-
-    run_output_dir = output_dir or (Path("checkpoints") / "finbert")
-    run_output_dir.mkdir(parents=True, exist_ok=True)
 
     tokenizer = AutoTokenizer.from_pretrained(mcfg.pretrained_model)
 
-    preprocess_split(data_path, run_output_dir, val_ratio=0.15, seed=tcfg.seed)
+    preprocess_split(tcfg.raw_data_path, run_output_dir, val_ratio=0.15, seed=tcfg.seed)
     train_ds = NewsClassificationDataset(
-        run_output_dir / "train.parquet",
+        tcfg.raw_data_path / "train.parquet",
         tokenizer,
         max_length=mcfg.max_seq_length,
         l1_to_idx=L1_TO_IDX,
         use_content=tcfg.use_content,
     )
     val_ds = NewsClassificationDataset(
-        run_output_dir / "val.parquet",
+        tcfg.raw_data_path / "val.parquet",
         tokenizer,
         max_length=mcfg.max_seq_length,
         l1_to_idx=L1_TO_IDX,
@@ -237,14 +240,20 @@ def train_finbert(
     model.to(device)
 
     scaler = GradScaler(enabled=tcfg.fp16 and device.type == "cuda")
+    patience = tcfg.early_stopping_patience
+    no_decay = {"bias", "LayerNorm.weight", "LayerNorm.bias"}
 
-    # ═══ Phase 1: Freeze BERT, train heads ══════════════════════════════════════
+    best_val_l1_acc = 0.0
+    best_val_sent_acc = 0.0
+    epochs_without_improvement = 0
+    global_step = 0
+
+    # ── Phase 1: Freeze BERT, train heads ────────────────────────────────────────
+    logger.info(f"=== Phase 1: {tcfg.epochs_phase1} epochs with frozen BERT ===")
     freeze_bert(model)
 
-    no_decay = {"bias", "LayerNorm.weight", "LayerNorm.bias"}
     heads_params_decay = []
     heads_params_no_decay = []
-
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue
@@ -264,10 +273,6 @@ def train_finbert(
     phase1_warmup = int(phase1_steps * tcfg.warmup_ratio)
     scheduler = get_linear_schedule_with_warmup(optimizer, phase1_warmup, phase1_steps)
 
-    best_val_l1_acc = 0.0
-    global_step = 0
-
-    logger.info(f"=== Phase 1: {tcfg.epochs_phase1} epochs with frozen BERT ===")
     for epoch in range(tcfg.epochs_phase1):
         model.train()
         epoch_loss = 0.0
@@ -329,15 +334,25 @@ def train_finbert(
             },
         )
 
-        if val_metrics.l1_accuracy > best_val_l1_acc:
+        improved = val_metrics.l1_accuracy > best_val_l1_acc
+        if improved:
             best_val_l1_acc = val_metrics.l1_accuracy
+            best_val_sent_acc = val_metrics.sentiment_accuracy
             best_dir = run_output_dir / "best"
             model.save_pretrained(best_dir)
             tokenizer.save_pretrained(best_dir)
             logger.success(f"  ✓ Best saved (l1_acc={best_val_l1_acc:.4f})")
+            epochs_without_improvement = 0
+        else:
+            epochs_without_improvement += 1
+            logger.info(f"  No improvement ({epochs_without_improvement}/{patience})")
+            if epochs_without_improvement >= patience:
+                logger.info("[FinBERT] Early stopping triggered in Phase 1. Training stopped.")
+                break
 
-    # ═══ Phase 2: Unfreeze BERT, fine-tune all ═══════════════════════════════════
+    # ── Phase 2: Unfreeze BERT, fine-tune all ─────────────────────────────────────
     logger.info("=== Phase 2: Unfreezing BERT, training all params ===")
+    epochs_without_improvement = 0  # reset patience counter for Phase 2
     unfreeze_bert(model)
 
     bert_params_decay = []
@@ -431,18 +446,23 @@ def train_finbert(
             },
         )
 
-        if val_metrics.l1_accuracy > best_val_l1_acc:
+        improved = val_metrics.l1_accuracy > best_val_l1_acc
+        if improved:
             best_val_l1_acc = val_metrics.l1_accuracy
+            best_val_sent_acc = val_metrics.sentiment_accuracy
             best_dir = run_output_dir / "best"
             model.save_pretrained(best_dir)
             tokenizer.save_pretrained(best_dir)
             logger.success(f"  ✓ Best saved (l1_acc={best_val_l1_acc:.4f})")
+            epochs_without_improvement = 0
+        else:
+            epochs_without_improvement += 1
+            logger.info(f"  No improvement ({epochs_without_improvement}/{patience})")
+            if epochs_without_improvement >= patience:
+                logger.info("[FinBERT] Early stopping triggered in Phase 2. Training stopped.")
+                break
 
-    # ── Save final model ─────────────────────────────────────────────
-    final_dir = run_output_dir / "final"
-    model.save_pretrained(final_dir)
-    tokenizer.save_pretrained(final_dir)
-
+    # ── Save label maps ────────────────────────────────────────────────────────
     label_info = {
         "l1_to_idx": L1_TO_IDX,
         "idx_to_l1": {str(k): v for k, v in IDX_TO_L1.items()},
@@ -454,41 +474,32 @@ def train_finbert(
     wb.log_summary(
         {
             "best_val_l1_accuracy": best_val_l1_acc,
-            "final_val_l1_accuracy": val_metrics.l1_accuracy,
-            "final_val_sentiment_accuracy": val_metrics.sentiment_accuracy,
+            "best_val_sentiment_accuracy": best_val_sent_acc,
         }
     )
+
+    # ── Export best model to ONNX ───────────────────────────────────────────────
+    from trainer.finbert.model import export_finbert_to_onnx
+
+    onnx_path = run_output_dir / "best.onnx"
+    export_finbert_to_onnx(
+        model_dir=run_output_dir / "best",
+        onnx_path=onnx_path,
+        max_seq_length=mcfg.max_seq_length,
+    )
+
+    # ── Upload ONNX as W&B artifact (must happen before wb.finish()) ──────────────
+    wb.upload_artifact(
+        artifact_path=onnx_path,
+        name=f"finbert-onnx-{run_name}",
+        artifact_type="model",
+        aliases=["latest", "best"],
+    )
+
     wb.finish()
 
     logger.info(f"\n[FinBERT] Training complete. Best val L1 accuracy: {best_val_l1_acc:.4f}")
-    logger.info(f"[FinBERT] Checkpoints: {run_output_dir}")
+    logger.info(f"[FinBERT] Best checkpoint: {run_output_dir / 'best'}")
+    logger.info(f"[FinBERT] ONNX model: {onnx_path}")
 
-    return {"best": run_output_dir / "best", "final": run_output_dir / "final"}
-
-
-# ─── CLI ─────────────────────────────────────────────────────────────────────
-
-
-if __name__ == "__main__":
-    import typer
-
-    app = typer.Typer(add_completion=False)
-
-    @app.command()
-    def train(
-        data: str = typer.Option(..., help="Path to labeled news parquet file"),
-        config: str | None = None,
-        output: str | None = None,
-        project: str = "news2etf",
-        name: str | None = None,
-    ) -> None:
-        """Train FinBERT on labeled news data."""
-        train_finbert(
-            data_path=Path(data),
-            output_dir=Path(output) if output else None,
-            config_path=config,
-            wandb_project=project,
-            wandb_name=name,
-        )
-
-    app()
+    return {"best": run_output_dir / "best", "onnx": onnx_path}

@@ -14,10 +14,12 @@ Usage:
 from __future__ import annotations
 
 import os
+from pathlib import Path
 from typing import Any
 
-import wandb
 from loguru import logger
+
+import wandb
 
 
 def _build_lstm_config_dict(cfg: Any) -> dict[str, Any]:
@@ -49,8 +51,10 @@ class WandbHandler:
         config: Any = None,
         config_dict: dict[str, Any] | None = None,
         tags: list[str] | None = None,
+        mode: str = "online",
+        entity: str | None = None,
     ):
-        self.enabled = bool(os.environ.get("WANDB_API_KEY"))
+        self.enabled = mode != "disabled" and (mode != "online" or bool(os.environ.get("WANDB_API_KEY")))
         self._run = None
         self._run_id: str | None = None
         self._tags = tags or []
@@ -63,12 +67,14 @@ class WandbHandler:
         if self.enabled:
             self._run = wandb.init(
                 project=project,
+                entity=entity,
                 name=name,
                 config=cfg_dict,
                 tags=self._tags,
+                mode=mode,  # type: ignore
             )
             self._run_id = self._run.id
-            logger.info(f"[Wandb] Started run: {self._run.url} (tags={self._tags})")
+            logger.info(f"[Wandb] Started run: {self._run.url} (tags={self._tags}, mode={mode})")
 
     def log(self, metrics: dict[str, Any], step: int | None = None) -> None:
         """Log metrics to wandb dashboard."""
@@ -115,3 +121,29 @@ class WandbHandler:
     def run_id(self) -> str | None:
         """W&B run ID."""
         return self._run_id
+
+    def upload_artifact(
+        self,
+        artifact_path: str | Path,
+        name: str,
+        artifact_type: str = "model",
+        aliases: list[str] | None = None,
+    ) -> None:
+        """Upload a local file or directory as a W&B artifact."""
+        if not self.enabled:
+            logger.info(f"[Wandb] Artifact upload skipped (disabled): {name}")
+            return
+
+        artifact_path = Path(artifact_path)
+        if not artifact_path.exists():
+            logger.warning(f"[Wandb] Artifact path does not exist: {artifact_path}")
+            return
+        artifact = wandb.Artifact(name=name, type=artifact_type)
+        if artifact_path.is_dir():
+            artifact.add_dir(str(artifact_path))
+        else:
+            artifact.add_file(str(artifact_path), name=artifact_path.name)
+
+        if self._run is not None:
+            self._run.log_artifact(artifact, aliases=aliases or [])
+            logger.info(f"[Wandb] Artifact uploaded: {name} ({artifact_type})")

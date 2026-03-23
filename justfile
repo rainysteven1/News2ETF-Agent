@@ -24,8 +24,8 @@ backtest start end:
 signals-train:
     python -m trainer.main signals-train
 
-finbert-train data:
-    python -m trainer.main finbert-train --data {{data}}
+finbert-train:
+    python -m trainer.main finbert-train 
 
-setfit-train data:
-    python -m trainer.main setfit-train --data {{data}}
+setfit-train:
+    python -m trainer.main setfit-train
