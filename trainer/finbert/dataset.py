@@ -10,8 +10,6 @@ Expected parquet columns:
 from __future__ import annotations
 
 from pathlib import Path
-from typing import cast
-
 import polars as pl
 import torch
 from sklearn.model_selection import train_test_split
@@ -122,7 +120,7 @@ class NewsClassificationDataset(Dataset):
         if self.contents is not None:
             content = self.contents[idx]
             if content is not None and content:
-                text = text + "[SEP]" + str(content)[:256]
+                text = f"{text}[SEP]{str(content)[:256]}"
 
         encoding = self.tokenizer(
             text,
@@ -132,14 +130,16 @@ class NewsClassificationDataset(Dataset):
             return_tensors="pt",
         )
 
-        input_ids = cast(torch.Tensor, encoding["input_ids"])
-        attention_mask = cast(torch.Tensor, encoding["attention_mask"])
-        token_type_ids = cast(torch.Tensor, encoding.get("token_type_ids", torch.zeros_like(input_ids)))
+        input_ids = encoding["input_ids"].squeeze(0)
+        attention_mask = encoding["attention_mask"].squeeze(0)
+        token_type_ids = encoding.get("token_type_ids", torch.zeros_like(input_ids))
+        if token_type_ids.dim() > 1:
+            token_type_ids = token_type_ids.squeeze(0)
 
         return {
-            "input_ids": input_ids.squeeze(0),
-            "attention_mask": attention_mask.squeeze(0),
-            "token_type_ids": token_type_ids.squeeze(0),
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "token_type_ids": token_type_ids,
             "l1_label": torch.tensor(self.l1_labels[idx], dtype=torch.long),
             "sentiment_label": torch.tensor(self.sentiment_labels[idx], dtype=torch.long),
         }
@@ -174,7 +174,7 @@ class NewsInferenceDataset(Dataset):
         if self.contents is not None:
             content = self.contents[idx]
             if content is not None and content:
-                text = text + "[SEP]" + str(content)[:256]
+                text = f"{text}[SEP]{str(content)[:256]}"
 
         encoding = self.tokenizer(
             text,
@@ -184,12 +184,14 @@ class NewsInferenceDataset(Dataset):
             return_tensors="pt",
         )
 
-        input_ids = cast(torch.Tensor, encoding["input_ids"])
-        attention_mask = cast(torch.Tensor, encoding["attention_mask"])
-        token_type_ids = cast(torch.Tensor, encoding.get("token_type_ids", torch.zeros_like(input_ids)))
+        input_ids = encoding["input_ids"].squeeze(0)
+        attention_mask = encoding["attention_mask"].squeeze(0)
+        token_type_ids = encoding.get("token_type_ids", torch.zeros_like(input_ids))
+        if token_type_ids.dim() > 1:
+            token_type_ids = token_type_ids.squeeze(0)
 
         return {
-            "input_ids": input_ids.squeeze(0),
-            "attention_mask": attention_mask.squeeze(0),
-            "token_type_ids": token_type_ids.squeeze(0),
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "token_type_ids": token_type_ids,
         }

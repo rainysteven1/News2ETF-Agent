@@ -20,9 +20,9 @@ from loguru import logger
 from sentence_transformers.losses import CosineSimilarityLoss
 from setfit import SetFitModel, SetFitTrainer
 
-from trainer.config import SetFitModelConfig, SetFitTrainingConfig
+from trainer.config import LabelStats, SetFitModelConfig, SetFitTrainingConfig
 from trainer.config import load_config as load_trainer_config
-from trainer.setfit_module.model import LabelStats, _safe_name, export_setfit_to_onnx
+from trainer.setfit_module.model import _safe_name, export_setfit_to_onnx
 from trainer.utils.seed import set_seed
 from trainer.wandb_handler import WandbHandler
 

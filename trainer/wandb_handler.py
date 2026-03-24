@@ -25,10 +25,10 @@ import wandb
 def _build_lstm_config_dict(cfg: Any) -> dict[str, Any]:
     """Build wandb config dict from TrainerConfig (LSTM pipeline)."""
     return {
-        "lstm_hidden_size": cfg.signals.hidden_size,
-        "lstm_num_layers": cfg.signals.num_layers,
-        "lstm_dropout": cfg.signals.dropout,
-        "seq_len": cfg.signals.sequence_length,
+        "lstm_hidden_size": cfg.tcn.hidden_size,
+        "lstm_num_layers": cfg.tcn.num_layers,
+        "lstm_dropout": cfg.tcn.dropout,
+        "seq_len": cfg.tcn.sequence_length,
         "epochs_pretrain": cfg.training.epochs_pretrain,
         "epochs_finetune": cfg.training.epochs_finetune,
         "batch_size": cfg.training.batch_size,

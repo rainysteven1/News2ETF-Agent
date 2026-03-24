@@ -6,28 +6,37 @@ mode = "online"
 project = "News2ETF-Agent-Tools"
 entity = "rainysteven_team"
 
-[signals.model]
+[signals.tcn]
 sequence_length = 5
-hidden_size = 64
-num_layers = 2
-dropout = 0.2
-
-[signals.training]
-epochs_pretrain = 15
-epochs_finetune = 10
-batch_size = 64
-lr = 0.001
-num_heads = 4
-anomaly_threshold = 0.03
+hidden_size = 16
+num_layers = 1
+dropout = 0.4
 
 [signals.isolation_forest]
 contamination = 0.1
 n_estimators = 100
 
 [signals.lightgbm]
-num_leaves = 31
-learning_rate = 0.05
-n_estimators = 200
+num_leaves = 7
+learning_rate = 0.02
+n_estimators = 500
+
+[signals.dataset]
+raw_data_path = "./trainer/data/labeled/signals/raw.parquet"
+output_sentiment = "./trainer/data/labeled/signals/sentiment_weekly.parquet"
+train_end_week = "2021-01-03"
+freq = "weekly"                                                              # "weekly" or "daily"
+cross_industry = true                                                        # pool all industries into one TCN for pretrain
+
+[signals.training]
+epochs_pretrain = 5
+epochs_finetune = 3
+batch_size = 64
+lr = 0.001
+num_heads = 4
+anomaly_threshold = 0.03
+output_checkpoint = "./trainer/checkpoints/signals"
+
 
 [finbert.model]
 pretrained_model = "./trainer/data/pretrained_models/Erlangshen-Roberta-110M-Sentiment"

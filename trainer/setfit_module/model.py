@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
-from typing import Any
 
 import torch
 from loguru import logger
 from setfit import SetFitModel
+
+from trainer.config import LabelStats
 
 
 def export_setfit_to_onnx(
@@ -124,39 +124,6 @@ def export_setfit_to_onnx(
     except Exception as exc:
         logger.error(f"[ONNX] Export failed ({exc}), skipping ONNX export for {model_dir}")
         raise  # Re-raise so caller knows it failed
-
-
-class LabelStats:
-    """Load and access label_stats.json via config.toml key (singleton)."""
-
-    _instance: LabelStats | None = None
-    _initialized: bool = False
-
-    def __new__(cls, stats_path: Path | None = None) -> LabelStats:
-        if cls._instance is None:
-            instance = super().__new__(cls)
-            cls._instance = instance
-        return cls._instance
-
-    def __init__(self, stats_path: Path | None = None):
-        if LabelStats._initialized:
-            return
-        if stats_path is None:
-            from trainer.config import load_config as _load_trainer_config
-
-            cfg = _load_trainer_config()
-            stats_path = cfg.setfit.label_stats
-        with open(stats_path, encoding="utf-8") as f:
-            self._stats: dict[str, Any] = json.load(f)
-        LabelStats._initialized = True
-
-    def get_major_categories(self) -> list[str]:
-        """Return sorted list of major categories."""
-        return sorted(self._stats["major_category"].keys())
-
-    def get_sub_categories(self, major: str) -> list[str]:
-        """Return sorted list of sub-categories for a major."""
-        return sorted(self._stats["sub_category_by_major"][major].keys())
 
 
 class SetFitSubCategoryClassifier:

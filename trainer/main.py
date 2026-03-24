@@ -5,6 +5,9 @@ Usage:
     python -m trainer.main finbert export-onnx --model-path ... --onnx-path ...
     python -m trainer.main setfit train
     python -m trainer.main setfit export-onnx --model-path ... --onnx-path ...
+    python -m trainer.main signals train
+    python -m trainer.main signals train-tcn
+    python -m trainer.main signals train-lgbm
 """
 
 import sys
@@ -23,17 +26,20 @@ app = typer.Typer(add_completion=False)
 console = Console()
 
 
-# ── Signals ──────────────────────────────────────────────────────────────────
+# ── Signals subapp ────────────────────────────────────────────────────────────
 
 
-@app.command("signals-train")
+signals_app = typer.Typer(add_completion=False)
+
+
+@signals_app.command("train")
 def signals_train(
-    config: str | None = None,
+    force: bool = typer.Option(False, "--force", "-f", help="Force re-process raw data even if cached parquet exists."),
 ) -> None:
-    """Run full LSTM+Attention pipeline: pretrain → finetune → LightGBM stacking."""
+    """Run full TCN pipeline: pretrain → finetune → LightGBM stacking."""
     from trainer.signals.train import run_training
 
-    run_training(config_path=config)
+    run_training(force=force)
 
 
 # ── FinBERT subapp ──────────────────────────────────────────────────────────
@@ -106,6 +112,7 @@ def setfit_export_onnx(
 
 # ── Predict subapp ────────────────────────────────────────────────────────────
 
+
 predict_app = typer.Typer(add_completion=False)
 
 
@@ -155,6 +162,10 @@ def setfit_cmd(
     run_setfit(limit_rows=rows)
 
 
+# ── Register subapps ──────────────────────────────────────────────────────────
+
+
+app.add_typer(signals_app, name="signals")
 app.add_typer(finbert_app, name="finbert")
 app.add_typer(setfit_app, name="setfit")
 app.add_typer(predict_app, name="predict")

@@ -14,8 +14,10 @@ TOML structure:
 
 from __future__ import annotations
 
+import json
 import tomllib
 from pathlib import Path
+from typing import Any
 
 from pydantic import BaseModel
 
@@ -25,8 +27,8 @@ _ROOT = Path(__file__).resolve().parent.parent
 # ─── Signals (LSTM pipeline) ────────────────────────────────────────────────────────
 
 
-class SignalsModelConfig(BaseModel):
-    """LSTM + Attention hyperparameters."""
+class SignalsTCNConfig(BaseModel):
+    """TCN hyperparameters."""
 
     sequence_length: int = 5
     hidden_size: int = 64
@@ -43,6 +45,7 @@ class SignalsTrainingConfig(BaseModel):
     lr: float = 0.001
     num_heads: int = 4
     anomaly_threshold: float = 0.03
+    output_checkpoint: Path | None = None
 
 
 class SignalsIsolationForestConfig(BaseModel):
@@ -54,6 +57,15 @@ class SignalsLightGBMConfig(BaseModel):
     num_leaves: int = 31
     learning_rate: float = 0.05
     n_estimators: int = 200
+
+
+class SignalsDatasetConfig(BaseModel):
+    """Dataset config for signals pipeline."""
+    raw_data_path: Path | None = None
+    output_sentiment: Path | None = None  # aggregated sentiment parquet; if exists, load directly
+    train_end_week: str = "2021-01-03"
+    freq: str = "weekly"  # "weekly" or "daily"
+    cross_industry: bool = True  # pool all industries into one TCN for pretrain
 
 
 # ─── FinBERT ──────────────────────────────────────────────────────────────────────
@@ -149,10 +161,11 @@ class DataConfig(BaseModel):
 
 class TrainerConfig(BaseModel):
     wandb: WandbConfig = WandbConfig()
-    signals: SignalsModelConfig = SignalsModelConfig()
+    tcn: SignalsTCNConfig = SignalsTCNConfig()
     training: SignalsTrainingConfig = SignalsTrainingConfig()
     isolation_forest: SignalsIsolationForestConfig = SignalsIsolationForestConfig()
     lightgbm: SignalsLightGBMConfig = SignalsLightGBMConfig()
+    dataset: SignalsDatasetConfig = SignalsDatasetConfig()
     finbert: FinBERTModelConfig = FinBERTModelConfig()
     finbert_training: FinBERTTrainingConfig = FinBERTTrainingConfig()
     setfit: SetFitModelConfig = SetFitModelConfig()
@@ -174,10 +187,11 @@ def load_config(path: str | Path | None = None) -> TrainerConfig:
     # Map TOML section names to TrainerConfig field names
     toml_to_field = {
         "wandb": "wandb",
-        "signals.model": "signals",
+        "signals.tcn": "tcn",
         "signals.training": "training",
         "signals.isolation_forest": "isolation_forest",
         "signals.lightgbm": "lightgbm",
+        "signals.dataset": "dataset",
         "finbert.model": "finbert",
         "finbert.training": "finbert_training",
         "setfit.model": "setfit",
@@ -221,6 +235,18 @@ def load_config(path: str | Path | None = None) -> TrainerConfig:
     if "raw_data_path" in setfit_section:
         cfg.setfit_training.raw_data_path = _ROOT / setfit_section["raw_data_path"]
 
+    # Resolve signals dataset raw_data_path and output_sentiment
+    dataset_section = raw.get("signals", {}).get("dataset", {})
+    if "raw_data_path" in dataset_section:
+        cfg.dataset.raw_data_path = _ROOT / dataset_section["raw_data_path"]
+    if "output_sentiment" in dataset_section:
+        cfg.dataset.output_sentiment = _ROOT / dataset_section["output_sentiment"]
+
+    # Resolve signals training output_checkpoint
+    training_section = raw.get("signals", {}).get("training", {})
+    if "output_checkpoint" in training_section:
+        cfg.training.output_checkpoint = _ROOT / training_section["output_checkpoint"]
+
     # Resolve predict paths
     predict_section = raw.get("predict", {})
     for key in ("finbert_onnx_dir", "finbert_output_path", "setfit_base_dir", "input_path", "output_path"):
@@ -229,3 +255,37 @@ def load_config(path: str | Path | None = None) -> TrainerConfig:
             setattr(cfg.predict, key, resolved)
 
     return cfg
+
+
+# ─── Shared utilities ───────────────────────────────────────────────────────────
+
+
+class LabelStats:
+    """Load and access label_stats.json via config.toml key (singleton)."""
+
+    _instance: "LabelStats | None" = None
+    _initialized: bool = False
+
+    def __new__(cls, stats_path: Path | None = None) -> "LabelStats":
+        if cls._instance is None:
+            instance = super().__new__(cls)
+            cls._instance = instance
+        return cls._instance
+
+    def __init__(self, stats_path: Path | None = None):
+        if LabelStats._initialized:
+            return
+        if stats_path is None:
+            cfg = load_config()
+            stats_path = cfg.setfit.label_stats
+        with open(stats_path, encoding="utf-8") as f:
+            self._stats: dict[str, Any] = json.load(f)
+        LabelStats._initialized = True
+
+    def get_major_categories(self) -> list[str]:
+        """Return sorted list of major categories."""
+        return sorted(self._stats["major_category"].keys())
+
+    def get_sub_categories(self, major: str) -> list[str]:
+        """Return sorted list of sub-categories for a major."""
+        return sorted(self._stats["sub_category_by_major"][major].keys())

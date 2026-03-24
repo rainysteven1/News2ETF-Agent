@@ -1,13 +1,13 @@
-"""Training pipeline: LSTM+Attention → LightGBM Stacking.
+"""Training pipeline: TCN → LightGBM Stacking.
 
 Architecture:
-  1. Pretrain LSTM+Attention on ALL industries mixed (data augmentation)
-  2. Finetune per-industry LSTM+Attention (optional)
-  3. Extract LSTM hidden states → use as feature for LightGBM
-  4. LightGBM trains on: [lstm_hidden, raw_sentiment, news_count] → next-week return
+  1. Pretrain TCN on ALL industries mixed (data augmentation)
+  2. Finetune per-industry TCN (optional)
+  3. Extract TCN outputs → use as feature for LightGBM
+  4. LightGBM trains on: [tcn_reg, delta_sentiment, news_count, news_heat, interactions]
+  5. IsolationForest on news volume features
 
 Loguru handles console output. WandbHandler pushes metrics to wandb dashboard.
-Both run in parallel — they are complementary.
 """
 
 from __future__ import annotations
@@ -22,114 +22,38 @@ import polars as pl
 import torch
 import torch.nn as nn
 from loguru import logger
+from scipy import stats
+from sklearn.metrics import r2_score
+from torch.optim.adam import Adam
 from torch.utils.data import DataLoader, TensorDataset
 
 from trainer.config import TrainerConfig, load_config
-from trainer.signals.models import LSTMWithAttention
+from trainer.signals.dataset import build_lgbm_features, build_sequences, WeeklySignalDataset
+from trainer.signals.models import TCN
 from trainer.wandb_handler import WandbHandler
-
-# ─── Data Preparation ───────────────────────────────────────────────────────────
-
-
-def build_sequences(
-    sentiment_df: pl.DataFrame,
-    industries: list[str],
-    seq_len: int,
-    anomaly_threshold: float = 0.03,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Build LSTM training data from sentiment time series.
-
-    Returns:
-        X:     (N, seq_len, 1) — sentiment_mean sequences
-        y_reg: (N, 1) — next-week direction: 1 / 0 / -1
-        y_cls: (N, 1) — 1 if |return| > threshold else 0
-    """
-    X_list, y_reg_list, y_cls_list = [], [], []
-
-    for ind in industries:
-        ind_df = sentiment_df.filter(pl.col("industry") == ind).sort("date")
-        if len(ind_df) < seq_len + 2:
-            continue
-        vals = ind_df["sentiment_mean"].to_numpy()
-        rets = ind_df["return"].to_numpy() if "return" in ind_df.columns else np.zeros_like(vals)
-
-        for i in range(len(vals) - seq_len - 1):
-            X_list.append(vals[i : i + seq_len])
-            next_ret = rets[i + seq_len]
-            y_reg_list.append(1 if next_ret > 0 else (-1 if next_ret < 0 else 0))
-            y_cls_list.append(1 if abs(next_ret) > anomaly_threshold else 0)
-
-    X = np.array(X_list, dtype=np.float32).reshape(-1, seq_len, 1)
-    y_reg = np.array(y_reg_list, dtype=np.float32).reshape(-1, 1)
-    y_cls = np.array(y_cls_list, dtype=np.float32).reshape(-1, 1)
-    return X, y_reg, y_cls
-
-
-def build_lgbm_features(
-    sentiment_df: pl.DataFrame,
-    industries: list[str],
-    seq_len: int,
-    lstm_model: LSTMWithAttention,
-    device: torch.device,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Build LightGBM feature matrix from LSTM hidden states + raw signals.
-
-    Features:
-        [delta_sentiment_1w, delta_sentiment_2w, news_count, news_heat,
-         lstm_reg_output, lstm_cls_output]
-    """
-    feat_rows, label_rows = [], []
-
-    for ind in industries:
-        ind_df = sentiment_df.filter(pl.col("industry") == ind).sort("date")
-        if len(ind_df) < seq_len + 2:
-            continue
-        vals = ind_df["sentiment_mean"].to_numpy()
-        nc = ind_df["news_count"].to_numpy()
-        nh = ind_df["news_heat"].to_numpy() if "news_heat" in ind_df.columns else np.zeros_like(nc)
-
-        for i in range(seq_len, len(vals) - 1):
-            delta1 = vals[i] - vals[i - 1]
-            delta2 = vals[i] - vals[i - 2]
-            news_count = nc[i]
-            news_heat = nh[i]
-            next_dir = 1 if vals[i + 1] > vals[i] else (-1 if vals[i + 1] < vals[i] else 0)
-
-            x_t = torch.FloatTensor(vals[i - seq_len : i]).reshape(1, seq_len, 1).to(device)
-            with torch.no_grad():
-                reg_out, cls_out = lstm_model(x_t)
-            lstm_reg = reg_out.item()
-            lstm_cls = cls_out.item()
-
-            feat_rows.append([delta1, delta2, news_count, news_heat, lstm_reg, lstm_cls])
-            label_rows.append(next_dir)
-
-    return np.array(feat_rows, dtype=np.float32), np.array(label_rows, dtype=np.int32)
-
 
 # ─── Model Training ─────────────────────────────────────────────────────────────
 
 
-def train_lstm_attention_pretrain(
+def train_tcn_pretrain(
     X: np.ndarray,
     y_reg: np.ndarray,
     y_cls: np.ndarray,
     cfg: TrainerConfig,
     wb: WandbHandler,
     device: torch.device,
-) -> LSTMWithAttention:
-    """Step A: Pretrain LSTM+Attention on ALL industries mixed."""
+) -> TCN:
+    """Step A: Pretrain TCN on ALL industries mixed."""
     tc = cfg.training
-    sc = cfg.signals
-    model = LSTMWithAttention(
+    sc = cfg.tcn
+    model = TCN(
         input_size=1,
         hidden_size=sc.hidden_size,
         num_layers=sc.num_layers,
         dropout=sc.dropout,
-        num_heads=tc.num_heads,
     ).to(device)
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=tc.lr)
+    optimizer = Adam(model.parameters(), lr=tc.lr, weight_decay=1e-3)
     reg_criterion = nn.MSELoss()
     cls_criterion = nn.BCELoss()
 
@@ -143,7 +67,7 @@ def train_lstm_attention_pretrain(
             bx, by_reg, by_cls = bx.to(device), by_reg.to(device), by_cls.to(device)
             optimizer.zero_grad()
             pred_reg, pred_cls = model(bx)
-            loss = reg_criterion(pred_reg, by_reg) + 0.3 * cls_criterion(pred_cls, by_cls)
+            loss = reg_criterion(pred_reg, by_reg) + 0.01 * cls_criterion(pred_cls, by_cls)
             loss.backward()
             optimizer.step()
             total_loss += loss.item()
@@ -166,41 +90,50 @@ def train_lstm_attention_pretrain(
 def finetune_per_industry(
     sentiment_df: pl.DataFrame,
     industries: list[str],
-    base_model: LSTMWithAttention,
+    base_model: TCN,
     cfg: TrainerConfig,
     wb: WandbHandler,
     device: torch.device,
-) -> LSTMWithAttention:
-    """Step B: Finetune LSTM+Attention per industry (freeze all but last LSTM layer)."""
+) -> TCN:
+    """Step B: Finetune TCN per industry (freeze all but last temporal block)."""
     tc = cfg.training
-    # Freeze: only unfreeze last LSTM layer + attention
-    for name, param in base_model.named_parameters():
-        is_lstm_ih = "lstm" in name and "weight_ih" in name
-        is_fc = "reg_head" in name or "cls_head" in name
-        param.requires_grad = not is_lstm_ih and not is_fc
+    seq_len = cfg.tcn.sequence_length
 
-    optimizer = torch.optim.Adam(filter(lambda p: p.requires_grad, base_model.parameters()), lr=tc.lr * 0.5)
+    # Freeze all but last TCN block + heads
+    num_layers = cfg.tcn.num_layers
+    for i, block in enumerate(base_model.network):
+        freeze = i < num_layers - 1
+        for param in block.parameters():
+            param.requires_grad = not freeze
+
+    optimizer = Adam(filter(lambda p: p.requires_grad, base_model.parameters()), lr=tc.lr * 0.5)
     reg_criterion = nn.MSELoss()
     cls_criterion = nn.BCELoss()
 
     for ind in industries:
         ind_df = sentiment_df.filter(pl.col("industry") == ind).sort("date")
-        if len(ind_df) < tc.batch_size + 2:
+        if len(ind_df) < seq_len + 2:
             continue
         vals = ind_df["sentiment_mean"].to_numpy()
         rets = ind_df["return"].to_numpy() if "return" in ind_df.columns else np.zeros_like(vals)
 
         X_ind, y_reg_ind, y_cls_ind = [], [], []
-        for i in range(len(vals) - tc.batch_size - 1):
-            X_ind.append(vals[i : i + tc.batch_size])
-            nr = rets[i + tc.batch_size]
-            y_reg_ind.append(1 if nr > 0 else (-1 if nr < 0 else 0))
+        for i in range(len(vals) - seq_len - 1):
+            X_ind.append(vals[i : i + seq_len])
+            # Continuous target (same as pretrain)
+            target = np.clip(
+                (vals[i + seq_len] - vals[i + seq_len - 1]) / (np.abs(vals[i + seq_len - 1]) + 1e-9),
+                -1,
+                1,
+            )
+            y_reg_ind.append(target)
+            nr = rets[i + seq_len]
             y_cls_ind.append(1 if abs(nr) > tc.anomaly_threshold else 0)
 
         if len(X_ind) < 2:
             continue
 
-        X_t = torch.FloatTensor(np.array(X_ind, dtype=np.float32)).reshape(-1, tc.batch_size, 1).to(device)
+        X_t = torch.FloatTensor(np.array(X_ind, dtype=np.float32)).reshape(-1, seq_len, 1).to(device)
         y_reg_t = torch.FloatTensor(np.array(y_reg_ind, dtype=np.float32)).reshape(-1, 1).to(device)
         y_cls_t = torch.FloatTensor(np.array(y_cls_ind, dtype=np.float32)).reshape(-1, 1).to(device)
 
@@ -213,7 +146,7 @@ def finetune_per_industry(
             for bx, by_reg, by_cls in loader:
                 optimizer.zero_grad()
                 pred_reg, pred_cls = base_model(bx)
-                loss = reg_criterion(pred_reg, by_reg) + 0.3 * cls_criterion(pred_cls, by_cls)
+                loss = reg_criterion(pred_reg, by_reg) + 0.01 * cls_criterion(pred_cls, by_cls)
                 loss.backward()
                 optimizer.step()
                 total_loss += loss.item()
@@ -227,94 +160,208 @@ def finetune_per_industry(
 def train_lgbm_stacking(
     X: np.ndarray,
     y: np.ndarray,
-    cfg: TrainerConfig,
-    wb: WandbHandler,
+    dates: np.ndarray | None = None,
+    cfg: TrainerConfig | None = None,
+    wb: WandbHandler | None = None,
 ) -> Any:
-    """Step C: Train LightGBM on stacking features."""
+    """Step C: Train LightGBM on stacking features.
+
+    If dates is provided, splits by time (last 20% by date) instead of random.
+    """
     import lightgbm as lgb
 
-    split = int(len(X) * 0.8)
-    X_train, X_val = X[:split], X[split:]
-    y_train, y_val = y[:split], y[split:]
+    if dates is not None:
+        # Time-based split: sort by date, use last 20% as validation
+        order = np.argsort(dates)
+        X, y = X[order], y[order]
+        split = int(len(X) * 0.8)
+        X_train, X_val = X[:split], X[split:]
+        y_train, y_val = y[:split], y[split:]
+    else:
+        split = int(len(X) * 0.8)
+        X_train, X_val = X[:split], X[split:]
+        y_train, y_val = y[:split], y[split:]
 
     model = lgb.LGBMRegressor(
-        num_leaves=cfg.lightgbm.num_leaves,
-        learning_rate=cfg.lightgbm.learning_rate,
-        n_estimators=cfg.lightgbm.n_estimators,
+        num_leaves=cfg.lightgbm.num_leaves if cfg else 7,
+        learning_rate=cfg.lightgbm.learning_rate if cfg else 0.02,
+        n_estimators=cfg.lightgbm.n_estimators if cfg else 500,
+        min_child_samples=10,
+        lambda_l1=0.5,
+        lambda_l2=0.5,
         verbose=-1,
     )
     model.fit(
         X_train,
         y_train,
         eval_set=[(X_val, y_val)],
-        callbacks=[lgb.log_evaluation(period=20)],
+        callbacks=[
+            lgb.early_stopping(stopping_rounds=10),
+            lgb.log_evaluation(period=50),
+        ],
     )
 
-    train_score = model.fit(X_train, y_train)
-    val_score = model.fit(X_val, y_val)
-    wb.log({"lgbm_train_r2": train_score, "lgbm_val_r2": val_score})
+    train_pred = model.predict(X_train)
+    val_pred = model.predict(X_val)
+
+    train_score = r2_score(y_train, train_pred)
+    val_score = r2_score(y_val, val_pred)
+
+    if wb is not None:
+        wb.log({"lgbm_train_r2": train_score, "lgbm_val_r2": val_score})
     logger.info(f"  [LightGBM] train_r2={train_score:.4f} val_r2={val_score:.4f}")
 
     return model
 
 
+# ─── Evaluation Metrics ───────────────────────────────────────────────────────
+
+
+def compute_industry_ic(
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    industries: np.ndarray,
+    stage: str,
+    wb: WandbHandler | None = None,
+) -> dict[str, float]:
+    """Compute Pearson IC per industry. Returns dict of industry → IC value."""
+    ic_dict: dict[str, float] = {}
+    unique_industries = np.unique(industries)
+    for ind in unique_industries:
+        mask = industries == ind
+        if mask.sum() < 3:
+            ic_dict[ind] = float("nan")
+            continue
+        ic, p = stats.pearsonr(y_true[mask], y_pred[mask])
+        ic_dict[ind] = ic
+
+    logger.info(f"  [{stage}] Industry IC:")
+    for ind, ic in ic_dict.items():
+        logger.info(f"    {ind}: {ic:.4f}")
+    if wb is not None:
+        ic_summary = {f"ic/{ind}": ic for ind, ic in ic_dict.items()}
+        wb.log_summary(ic_summary)
+    return ic_dict
+
+
+def analyze_residuals(
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    dates: np.ndarray | None = None,
+    stage: str = "",
+    wb: WandbHandler | None = None,
+) -> dict[str, Any]:
+    """Analyze residual distribution: normality (Shapiro-Wilk), skewness, kurtosis, time-based anomalies."""
+    residuals = y_true.astype(float) - y_pred.astype(float)
+
+    # Basic stats
+    skew = float(stats.skew(residuals))
+    kurt = float(stats.kurtosis(residuals))
+    shapiro_stat, shapiro_p = stats.shapiro(residuals[: min(len(residuals), 5000)])
+
+    result = {
+        f"{stage}/residual_skew": skew,
+        f"{stage}/residual_kurt": kurt,
+        f"{stage}/shapiro_stat": float(shapiro_stat),
+        f"{stage}/shapiro_p": float(shapiro_p),
+        f"{stage}/residual_mean": float(np.mean(residuals)),
+        f"{stage}/residual_std": float(np.std(residuals)),
+    }
+
+    # Time-based anomalies: split residuals into early/late halves
+    if dates is not None:
+        order = np.argsort(dates)
+        mid = len(residuals) // 2
+        early = residuals[order[:mid]]
+        late = residuals[order[mid:]]
+        result[f"{stage}/residual_early_mean"] = float(np.mean(early))
+        result[f"{stage}/residual_late_mean"] = float(np.mean(late))
+        result[f"{stage}/residual_early_std"] = float(np.std(early))
+        result[f"{stage}/residual_late_std"] = float(np.std(late))
+
+    if wb is not None:
+        wb.log_summary(result)
+
+    logger.info(
+        f"  [{stage}] Residuals — skew={skew:.3f} kurt={kurt:.3f} "
+        f"shapiro_p={shapiro_p:.4f} (p<0.05→non-normal)"
+    )
+    return result
+
+
 # ─── Main Pipeline ───────────────────────────────────────────────────────────
 
 
-def run_training(
-    config_path: str | None = None,
-    wandb_project: str | None = None,
-    wandb_name: str | None = None,
-) -> dict[str, str]:
+def run_training(force: bool = False) -> dict[str, str]:
     """Full pipeline: pretrain → finetune → LightGBM stacking."""
-    cfg = load_config(config_path)
+    cfg = load_config()
+    wcfg = cfg.wandb
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     wb = WandbHandler(
-        project=wandb_project or cfg.wandb.project,
+        project=wcfg.project,
         entity=cfg.wandb.entity,
-        name=wandb_name or cfg.wandb.name or f"etf-train-{datetime.now():%m%d-%H%M}",
+        name=f"signals-{datetime.now():%m%d-%H%M}",
         config=cfg,
-        tags=["signals"],
+        tags=["signals", "TCN", "LightGBM", "IsolationForest"],
         mode=cfg.wandb.mode,
     )
 
     logger.info(f"[Train] Device: {device}")
-    logger.info(f"[Train] Config: seq_len={cfg.signals.sequence_length}, hidden={cfg.signals.hidden_size}")
+    logger.info(f"[Train] Config: seq_len={cfg.tcn.sequence_length}, hidden={cfg.tcn.hidden_size}")
 
-    # ── Load sentiment data ────────────────────────────────────────────────────
-    sentiment_path = cfg.data.output_sentiment
-    if not sentiment_path.exists():
-        raise FileNotFoundError(f"Industry sentiment not found at {sentiment_path}. Run compute-signals first.")
-    sentiment_df = pl.read_parquet(sentiment_path)
+    # ── Load / build sentiment data via WeeklySignalDataset ───────────────────
+    #   If output_sentiment parquet exists → load directly; otherwise process raw.
+    ds = WeeklySignalDataset(cfg.dataset, force=force)
+    sentiment_df = ds.sentiment_df
+    assert sentiment_df is not None, "sentiment_df is None after dataset init"
     industries = sentiment_df["industry"].unique().to_list()
-    logger.info(f"[Train] {len(industries)} industries, {len(sentiment_df)} rows")
+    logger.info(
+        f"[Train] {len(industries)} industries, {len(sentiment_df)} rows "
+        f"(cached={ds.output_sentiment is not None and ds.output_sentiment.exists()})"
+    )
 
     # ── Step A: Pretrain on ALL industries mixed ───────────────────────────────
-    logger.info("\n[Step A] Pretrain LSTM+Attention on mixed industries...")
-    seq_len = cfg.signals.sequence_length
+    logger.info("\n[Step A] Pretrain TCN on mixed industries...")
+    seq_len = cfg.tcn.sequence_length
     tc = cfg.training
     X_all, y_reg_all, y_cls_all = build_sequences(sentiment_df, industries, seq_len, tc.anomaly_threshold)
     logger.info(f"  Mixed data: X={X_all.shape}, y_reg={y_reg_all.shape}, y_cls={y_cls_all.shape}")
 
-    lstm_model = train_lstm_attention_pretrain(X_all, y_reg_all, y_cls_all, cfg, wb, device)
+    tcn_model = train_tcn_pretrain(X_all, y_reg_all, y_cls_all, cfg, wb, device)
 
     # ── Step B: Finetune per industry ─────────────────────────────────────────
-    logger.info("\n[Step B] Finetune LSTM+Attention per industry...")
-    lstm_model = finetune_per_industry(sentiment_df, industries, lstm_model, cfg, wb, device)
+    logger.info("\n[Step B] Finetune TCN per industry...")
+    tcn_model = finetune_per_industry(sentiment_df, industries, tcn_model, cfg, wb, device)
 
-    # ── Save LSTM ──────────────────────────────────────────────────────────────
-    checkpoint_dir = Path("checkpoints")
-    checkpoint_dir.mkdir(exist_ok=True)
-    lstm_path = checkpoint_dir / "lstm_attention.pt"
-    torch.save(lstm_model.state_dict(), lstm_path)
-    logger.info(f"  [Save] lstm_attention.pt → {checkpoint_dir}")
+    # ── Save TCN ──────────────────────────────────────────────────────────────
+    checkpoint_dir = cfg.training.output_checkpoint / f"signals-{datetime.now():%m%d-%H%M}"
+    checkpoint_dir.mkdir(exist_ok=True, parents=True)
+    tcn_path = checkpoint_dir / "tcn.pt"
+    torch.save(tcn_model.state_dict(), tcn_path)
+    logger.info(f"  [Save] tcn.pt → {checkpoint_dir}")
 
     # ── Step C: LightGBM stacking ───────────────────────────────────────────────
     logger.info("\n[Step C] Build stacking features + train LightGBM...")
-    X_lgbm, y_lgbm = build_lgbm_features(sentiment_df, industries, seq_len, lstm_model, device)
+    X_lgbm, y_lgbm, dates, industry_lgbm = build_lgbm_features(
+        sentiment_df, industries, seq_len, tcn_model, device
+    )
     logger.info(f"  LGBM data: X={X_lgbm.shape}, y={y_lgbm.shape}")
 
-    lgbm_model = train_lgbm_stacking(X_lgbm, y_lgbm, cfg, wb)
+    lgbm_model = train_lgbm_stacking(X_lgbm, y_lgbm, dates, cfg, wb)
+
+    # ── Post-step C: Industry IC + Residual analysis ─────────────────────────────
+    # Time-based split (last 20%)
+    order = np.argsort(dates)
+    split = int(len(X_lgbm) * 0.8)
+    val_idx = order[split:]
+    y_val_true = y_lgbm[val_idx]
+    y_val_pred = lgbm_model.predict(X_lgbm[val_idx])
+    industries_val = industry_lgbm[val_idx]
+
+    compute_industry_ic(y_val_true, y_val_pred, industries_val, stage="LGBM_val", wb=wb)
+    analyze_residuals(y_val_true, y_val_pred, dates[val_idx], stage="LGBM_val", wb=wb)
+
     lgbm_path = checkpoint_dir / "lgbm_stacking.txt"
     lgbm_model.booster_.save_model(str(lgbm_path))
     logger.info(f"  [Save] lgbm_stacking.txt → {checkpoint_dir}")
@@ -343,85 +390,85 @@ def run_training(
         pickle.dump(iforest, f)
     logger.info(f"  [Save] iforest_model.pkl → {checkpoint_dir}")
 
+    # ── Step E: Export all models to ONNX ─────────────────────────────────────
+    logger.info("\n[Step E] Exporting all models to ONNX...")
+    _export_all_onnx(tcn_model, lgbm_model, iforest, iforest_X, checkpoint_dir, seq_len, X_lgbm, device)
+
     wb.finish()
     logger.success("[Done] All models trained.")
 
     return {
-        "lstm_path": str(lstm_path),
+        "tcn_path": str(tcn_path),
         "lgbm_path": str(lgbm_path),
         "iforest_path": str(iforest_path),
     }
 
 
-# ─── CLI ─────────────────────────────────────────────────────────────────────
+def _export_all_onnx(
+    tcn_model: TCN,
+    lgbm_model: Any,
+    iforest: Any,
+    iforest_X: np.ndarray,
+    checkpoint_dir: Path,
+    seq_len: int,
+    X_lgbm: np.ndarray,
+    device: torch.device,
+) -> dict[str, Path | None]:
+    """Export TCN, LightGBM, and IsolationForest to ONNX format."""
+    import onnxmltools
+    from onnxmltools.convert.common.data_types import FloatTensorType
 
+    from trainer.signals.models import export_tcn_to_onnx
 
-if __name__ == "__main__":
-    import typer
+    results: dict[str, Path | None] = {}
 
-    app = typer.Typer(add_completion=False)
-
-    @app.command()
-    def train(
-        config: str | None = None,
-        project: str = "news2etf",
-        name: str | None = None,
-    ) -> None:
-        """Run full pipeline: pretrain → finetune → LightGBM stacking."""
-        run_training(config_path=config, wandb_project=project, wandb_name=name)
-
-    @app.command()
-    def train_lstm_only(config: str | None = None) -> None:
-        """Pretrain + finetune LSTM+Attention only."""
-        cfg = load_config(config)
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        wb = WandbHandler(project="news2etf", name="lstm-only", config=cfg, tags=["signals"])
-
-        sentiment_df = pl.read_parquet(cfg.data.output_sentiment)
-        industries = sentiment_df["industry"].unique().to_list()
-        seq_len = cfg.signals.sequence_length
-        tc = cfg.training
-
-        X_all, y_reg_all, y_cls_all = build_sequences(sentiment_df, industries, seq_len, tc.anomaly_threshold)
-        lstm_model = train_lstm_attention_pretrain(X_all, y_reg_all, y_cls_all, cfg, wb, device)
-        lstm_model = finetune_per_industry(sentiment_df, industries, lstm_model, cfg, wb, device)
-
-        checkpoint_dir = Path("checkpoints")
-        lstm_path = checkpoint_dir / "lstm_attention.pt"
-        torch.save(lstm_model.state_dict(), lstm_path)
-        logger.info(f"Saved → {lstm_path}")
-        wb.finish()
-
-    @app.command()
-    def train_lgbm_only(config: str | None = None) -> None:
-        """Train LightGBM stacking only (requires lstm_attention.pt)."""
-        cfg = load_config(config)
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        wb = WandbHandler(project="news2etf", name="lgbm-only", config=cfg, tags=["signals"])
-
-        checkpoint_dir = Path("checkpoints")
-        lstm_path = checkpoint_dir / "lstm_attention.pt"
-        if not lstm_path.exists():
-            logger.error("LSTM checkpoint not found. Run train_lstm_only first.")
-            raise typer.Exit(1)
-
-        lstm_model = LSTMWithAttention(
+    # ── TCN → ONNX ───────────────────────────────────────────────────────────
+    tcn_onnx_path = checkpoint_dir / "tcn.onnx"
+    try:
+        # Move model to CPU for export to avoid device mismatch
+        tcn_model_cpu = tcn_model.cpu()
+        export_tcn_to_onnx(
+            tcn_model_cpu,
+            tcn_onnx_path,
+            seq_len=seq_len,
             input_size=1,
-            hidden_size=cfg.signals.hidden_size,
-            num_layers=cfg.signals.num_layers,
-            dropout=cfg.signals.dropout,
-            num_heads=cfg.training.num_heads,
-        ).to(device)
-        lstm_model.load_state_dict(torch.load(lstm_path, map_location=device))
-        lstm_model.eval()
+        )
+        tcn_model.to(device)  # move back to original device
+        results["tcn_onnx"] = tcn_onnx_path
+        logger.info(f"  [ONNX] TCN → {tcn_onnx_path}")
+    except Exception as exc:
+        logger.warning(f"  [ONNX] TCN export failed: {exc}")
+        results["tcn_onnx"] = None
 
-        sentiment_df = pl.read_parquet(cfg.data.output_sentiment)
-        industries = sentiment_df["industry"].unique().to_list()
-        X_lgbm, y_lgbm = build_lgbm_features(sentiment_df, industries, cfg.signals.sequence_length, lstm_model, device)
-        lgbm_model = train_lgbm_stacking(X_lgbm, y_lgbm, cfg, wb)
-        lgbm_path = checkpoint_dir / "lgbm_stacking.txt"
-        lgbm_model.booster_.save_model(str(lgbm_path))
-        logger.info(f"Saved → {lgbm_path}")
-        wb.finish()
+    # ── LightGBM → ONNX ───────────────────────────────────────────────────────
+    lgbm_onnx_path = checkpoint_dir / "lgbm_stacking.onnx"
+    try:
+        initial_type = [("float_input", FloatTensorType([None, X_lgbm.shape[1]]))]
+        lgbm_onnx = onnxmltools.convert_lightgbm(lgbm_model, initial_types=initial_type, target_opset=15)
+        with open(lgbm_onnx_path, "wb") as f:
+            f.write(lgbm_onnx.SerializeToString())
+        results["lgbm_onnx"] = lgbm_onnx_path
+        logger.info(f"  [ONNX] LightGBM → {lgbm_onnx_path}")
+    except Exception as exc:
+        logger.warning(f"  [ONNX] LightGBM export failed: {exc}")
+        results["lgbm_onnx"] = None
 
-    app()
+    # ── IsolationForest → ONNX ────────────────────────────────────────────────
+    iforest_onnx_path = checkpoint_dir / "iforest.onnx"
+    try:
+        example_X = iforest_X[:1].astype(np.float32)
+        iforest_onnx = onnxmltools.convert_sklearn(
+            iforest,
+            initial_types=[("input", FloatTensorType([None, example_X.shape[1]]))],
+            target_opset=3,
+        )
+        with open(iforest_onnx_path, "wb") as f:
+            f.write(iforest_onnx.SerializeToString())  # type: ignore
+        results["iforest_onnx"] = iforest_onnx_path
+        logger.info(f"  [ONNX] IsolationForest → {iforest_onnx_path}")
+    except Exception as exc:
+        logger.warning(f"  [ONNX] IsolationForest export failed ({type(exc).__name__}): {exc}. "
+                      "Falling back to pickle.")
+        results["iforest_onnx"] = None
+
+    return results

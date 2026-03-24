@@ -20,7 +20,8 @@ from loguru import logger
 from transformers import AutoTokenizer
 
 from trainer.finbert.dataset import L1_CATEGORIES, SENTIMENT_LABELS
-from trainer.setfit_module.model import LabelStats, _safe_name
+from trainer.config import LabelStats
+from trainer.setfit_module.model import _safe_name
 
 # ─── ONNX Helpers ────────────────────────────────────────────────────────────────
 
