@@ -68,3 +68,14 @@ num_epochs = 3
 learning_rate = 2e-5
 min_samples_per_class = 2
 seed = 42
+
+[predict]
+finbert_onnx_dir = "./trainer/checkpoints/finbert/finbert-0323-2219"
+finbert_output_path = "./trainer/data/labeled/signals/finbert_only.parquet"
+finbert_workers = 16
+setfit_base_dir = "./trainer/checkpoints/setfit/setfit-0324-0125"
+input_path = "./trainer/data/news_raw.parquet"
+output_path = "./trainer/data/labeled/signals/raw.parquet"
+batch_size = 64
+finbert_max_length = 128
+setfit_max_length = 256

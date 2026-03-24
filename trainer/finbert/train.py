@@ -482,24 +482,34 @@ def train_finbert() -> dict[str, Path]:
     from trainer.finbert.model import export_finbert_to_onnx
 
     onnx_path = run_output_dir / "best.onnx"
-    export_finbert_to_onnx(
-        model_dir=run_output_dir / "best",
-        onnx_path=onnx_path,
-        max_seq_length=mcfg.max_seq_length,
-    )
+    try:
+        export_finbert_to_onnx(
+            model_dir=run_output_dir / "best",
+            onnx_path=onnx_path,
+            max_seq_length=mcfg.max_seq_length,
+        )
 
-    # ── Upload ONNX as W&B artifact (must happen before wb.finish()) ──────────────
-    wb.upload_artifact(
-        artifact_path=onnx_path,
-        name=f"finbert-onnx-{run_name}",
-        artifact_type="model",
-        aliases=["latest", "best"],
-    )
+        # ── Upload ONNX as W&B artifact ─────────────────────────────────────
+        wb.upload_artifact(
+            artifact_path=onnx_path,
+            name=f"finbert-onnx-{run_name}",
+            artifact_type="model",
+            aliases=["latest", "best"],
+        )
+        onnx_status = "exported"
+    except Exception as e:
+        logger.warning(
+            f"[FinBERT] ONNX export failed: {e}, pth checkpoint saved at "
+            f"{run_output_dir / 'best'} for manual conversion"
+        )
+        onnx_path = None
+        onnx_status = "failed"
 
     wb.finish()
 
     logger.info(f"\n[FinBERT] Training complete. Best val L1 accuracy: {best_val_l1_acc:.4f}")
     logger.info(f"[FinBERT] Best checkpoint: {run_output_dir / 'best'}")
-    logger.info(f"[FinBERT] ONNX model: {onnx_path}")
+    if onnx_path:
+        logger.info(f"[FinBERT] ONNX model: {onnx_path}")
 
-    return {"best": run_output_dir / "best", "onnx": onnx_path}
+    return {"best": run_output_dir / "best", "onnx": onnx_path, "onnx_status": onnx_status}

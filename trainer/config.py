@@ -1,15 +1,15 @@
-"""Trainer configuration — Pydantic models loaded from config.toml (project root).
+"""Trainer configuration -- Pydantic models loaded from config.toml (project root).
 
-No dependency on src/ — trainer is fully standalone.
+No dependency on src/ -- trainer is fully standalone.
 
 TOML structure:
-  [signals.model]       → LSTMWithAttention 超参
-  [signals.training]     → LSTM 训练超参
+  [signals.model]       -> LSTMWithAttention hyperparameters
+  [signals.training]     -> LSTM training hyperparameters
   [signals.isolation_forest]
   [signals.lightgbm]
-  [finbert.model]        → FinBERT 模型超参
-  [finbert.training]     → FinBERT 训练超参
-  [data]                 → 数据输出路径
+  [finbert.model]        -> FinBERT model hyperparameters
+  [finbert.training]     -> FinBERT training hyperparameters
+  [data]                 -> data output paths
 """
 
 from __future__ import annotations
@@ -26,7 +26,7 @@ _ROOT = Path(__file__).resolve().parent.parent
 
 
 class SignalsModelConfig(BaseModel):
-    """LSTM + Attention 超参."""
+    """LSTM + Attention hyperparameters."""
 
     sequence_length: int = 5
     hidden_size: int = 64
@@ -35,7 +35,7 @@ class SignalsModelConfig(BaseModel):
 
 
 class SignalsTrainingConfig(BaseModel):
-    """LSTM + Attention 训练超参."""
+    """LSTM + Attention training hyperparameters."""
 
     epochs_pretrain: int = 15
     epochs_finetune: int = 10
@@ -89,7 +89,7 @@ class FinBERTTrainingConfig(BaseModel):
 
 
 class SetFitModelConfig(BaseModel):
-    """SetFit 模型超参."""
+    """SetFit model hyperparameters."""
 
     pretrained_model: str = "sentence-transformers/paraphrase-multilingual-mpnet-base-v2"
     label_stats: Path = _ROOT / "label_stats.json"
@@ -97,7 +97,7 @@ class SetFitModelConfig(BaseModel):
 
 
 class SetFitTrainingConfig(BaseModel):
-    """SetFit 训练超参."""
+    """SetFit training hyperparameters."""
 
     raw_data_path: Path | None = None
     output_dir: Path | None = None
@@ -108,6 +108,20 @@ class SetFitTrainingConfig(BaseModel):
     num_epochs: int = 1
     learning_rate: float = 2e-5
     min_samples_per_class: int = 2
+
+
+class PredictConfig(BaseModel):
+    """Batch inference config for FinBERT + SetFit ONNX labeling."""
+
+    finbert_onnx_dir: Path | None = None
+    finbert_output_path: Path | None = None
+    finbert_workers: int = 8
+    setfit_base_dir: Path | None = None
+    input_path: Path | None = None
+    output_path: Path | None = None
+    batch_size: int = 64
+    finbert_max_length: int = 128
+    setfit_max_length: int = 256
 
 
 # ─── WandB ──────────────────────────────────────────────────────────────────────
@@ -144,6 +158,7 @@ class TrainerConfig(BaseModel):
     setfit: SetFitModelConfig = SetFitModelConfig()
     setfit_training: SetFitTrainingConfig = SetFitTrainingConfig()
     data: DataConfig = DataConfig()
+    predict: PredictConfig = PredictConfig()
 
 
 def load_config(path: str | Path | None = None) -> TrainerConfig:
@@ -168,6 +183,7 @@ def load_config(path: str | Path | None = None) -> TrainerConfig:
         "setfit.model": "setfit",
         "setfit.training": "setfit_training",
         "data": "data",
+        "predict": "predict",
     }
 
     filtered: dict = {}
@@ -204,5 +220,12 @@ def load_config(path: str | Path | None = None) -> TrainerConfig:
     setfit_section = raw.get("setfit", {}).get("training", {})
     if "raw_data_path" in setfit_section:
         cfg.setfit_training.raw_data_path = _ROOT / setfit_section["raw_data_path"]
+
+    # Resolve predict paths
+    predict_section = raw.get("predict", {})
+    for key in ("finbert_onnx_dir", "finbert_output_path", "setfit_base_dir", "input_path", "output_path"):
+        if key in predict_section:
+            resolved = _ROOT / predict_section[key]
+            setattr(cfg.predict, key, resolved)
 
     return cfg

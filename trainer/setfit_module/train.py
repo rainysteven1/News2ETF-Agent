@@ -22,7 +22,7 @@ from setfit import SetFitModel, SetFitTrainer
 
 from trainer.config import SetFitModelConfig, SetFitTrainingConfig
 from trainer.config import load_config as load_trainer_config
-from trainer.setfit.model import LabelStats, _safe_name, export_setfit_to_onnx
+from trainer.setfit_module.model import LabelStats, _safe_name, export_setfit_to_onnx
 from trainer.utils.seed import set_seed
 from trainer.wandb_handler import WandbHandler
 
@@ -127,6 +127,8 @@ def train_setfit_for_major(
         },
     )
 
+    wb.log_summary({"best_accuracy": accuracy, "best_f1": f1})
+
     # ── Save best model ───────────────────────────────────────────────────────
     best_dir = output_dir / "best"
 
@@ -159,8 +161,6 @@ def train_setfit_for_major(
         )
         onnx_path = None
         onnx_status = "failed"
-
-    wb.log_summary({"best_accuracy": accuracy, "best_f1": f1})
 
     return {
         "major": major,

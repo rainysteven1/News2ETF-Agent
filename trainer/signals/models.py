@@ -1,6 +1,6 @@
 """LSTM + Multi-Head Attention model for sentiment momentum prediction.
 
-No dependency on src/ — standalone trainer module.
+No dependency on src/ -- standalone trainer module.
 """
 
 from __future__ import annotations
@@ -10,7 +10,7 @@ try:
     import torch.nn as nn
     import torch.nn.functional as F
 except ImportError:
-    raise RuntimeError("torch not installed — install with: pip install torch")
+    raise RuntimeError("torch not installed -- install with: pip install torch")
 
 
 class LSTMWithAttention(nn.Module):
@@ -18,8 +18,8 @@ class LSTMWithAttention(nn.Module):
 
     Input:  (batch, seq_len, input_size)
     Output:
-        - regression:  (batch, 1) — momentum score in [-1, 1]
-        - classification: (batch, 1) — probability of anomaly (异常波动)
+        - regression:  (batch, 1) -- momentum score in [-1, 1]
+        - classification: (batch, 1) -- probability of anomaly
     """
 
     def __init__(

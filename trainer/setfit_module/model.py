@@ -26,25 +26,69 @@ def export_setfit_to_onnx(
     full pipeline export fails.
     """
     try:
-        model = SetFitModel.from_pretrained(str(model_dir))
-        model.eval()
+        # 1. Load model
+        model = SetFitModel.from_pretrained(model_dir)
 
-        # Use sentence-transformers' built-in ONNX export if available
-        st_model = model.model
-        if hasattr(st_model, "export_to_onnx"):
-            st_model.export_to_onnx(str(onnx_path), opset_version=opset_version)
-            logger.info(f"[ONNX] Exported SetFit sentence-encoder to {onnx_path}")
-            return
+        # Force all modules to CPU to avoid CUDA/CPU mismatch during ONNX export
+        model.to(torch.device("cpu"))
+        if model.model_body is not None:
+            model.model_body.to(torch.device("cpu"))
+        if model.model_head is not None and isinstance(model.model_head, torch.nn.Module):
+            model.model_head.to(torch.device("cpu"))
 
-        # Fallback: export the model_body (transformer) with the classifier
-        # This wraps the full SetFit inference: text -> embeddings -> logits
+        # 2. Extract sub-modules (st_body = Transformer + Pooling)
+        st_body = model.model_body
+        assert st_body is not None, "SetFit model must have model_body"
+        st_body.eval()
+        st_body.to(torch.device("cpu"))
+
+        # Process head: ensure it is a PyTorch Linear layer
+        assert model.model_head is not None, "SetFit model must have model_head"
+        if not isinstance(model.model_head, torch.nn.Module):
+            weights = torch.from_numpy(model.model_head.coef_).float()
+            bias = torch.from_numpy(model.model_head.intercept_).float()
+            head_module = torch.nn.Linear(weights.shape[1], weights.shape[0])
+            with torch.no_grad():
+                head_module.weight.copy_(weights)
+                head_module.bias.copy_(bias)
+        else:
+            head_module = model.model_head
+
+        head_module.eval()
+        head_module.to(torch.device("cpu"))
+
+        # 3. Wrap the full inference pipeline (replicate SetFit source logic)
+        class PredictWrapper(torch.nn.Module):
+            def __init__(self, body, head, normalize):
+                super().__init__()
+                self.transformer = body[0]  # Transformer module
+                self.pooler = body[1]  # Pooling module
+                self.head = head
+                self.normalize = normalize  # matches self.normalize_embeddings in SetFit source
+
+            def forward(self, input_ids, attention_mask):
+                # A. Encode
+                out = self.transformer({"input_ids": input_ids, "attention_mask": attention_mask})
+                out = self.pooler(out)
+                embeddings = out["sentence_embedding"]
+
+                # B. Normalize (SetFit encode may do this)
+                if self.normalize:
+                    embeddings = torch.nn.functional.normalize(embeddings, p=2, dim=1)
+
+                # C. Classify
+                logits = self.head(embeddings)
+                return logits
+
+        wrapper = PredictWrapper(st_body, head_module, model.normalize_embeddings)
+
+        # 4. Export
+        # Prepare dummy input using the model's tokenizer
         from transformers import AutoTokenizer
 
-        model_body_name = getattr(model.model_body, "name_or_path", None) or getattr(model.model_body, "config", None)
-        if model_body_name is None:
-            raise RuntimeError("Cannot determine model_body name for tokenizer")
-
-        tokenizer = AutoTokenizer.from_pretrained(model_body_name)
+        # Auto-detect the underlying Transformer path
+        tokenizer_name = st_body[0].auto_model.config._name_or_path
+        tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
         dummy_text = ["dummy input for ONNX export"]
         inputs = tokenizer(
             dummy_text,
@@ -54,28 +98,14 @@ def export_setfit_to_onnx(
             return_tensors="pt",
         )
 
-        # Build a wrapper that reproduces SetFitModel.predict() behavior
-        class SetFitOnnxWrapper(torch.nn.Module):
-            def __init__(self, setfit_model):
-                super().__init__()
-                self.model_body = setfit_model.model_body
-                self.model_head = setfit_model.model_head
-
-            def forward(self, input_ids, attention_mask):
-                features = self.model_body({"input_ids": input_ids, "attention_mask": attention_mask})
-                embeddings = features["sentence_embedding"]
-                logits = self.model_head(embeddings)
-                return logits
-
-        wrapper = SetFitOnnxWrapper(model)
+        onnx_path.parent.mkdir(parents=True, exist_ok=True)
 
         torch.onnx.export(
             wrapper,
             (inputs["input_ids"], inputs["attention_mask"]),
-            str(onnx_path),
+            onnx_path.as_posix(),
             export_params=True,
             opset_version=opset_version,
-            do_constant_folding=True,
             input_names=["input_ids", "attention_mask"],
             output_names=["logits"],
             dynamic_axes={
@@ -84,6 +114,11 @@ def export_setfit_to_onnx(
                 "logits": {0: "batch_size"},
             },
         )
+
+        tokenizer_dir = onnx_path.parent / "tokenizer"
+        tokenizer_dir.mkdir(exist_ok=True, parents=True)
+        tokenizer.save_pretrained(tokenizer_dir)  # Save tokenizer alongside for later loading
+
         logger.info(f"[ONNX] Exported SetFit full pipeline to {onnx_path}")
 
     except Exception as exc:

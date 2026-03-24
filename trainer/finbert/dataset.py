@@ -1,10 +1,10 @@
 """Dataset for FinBERT news classification.
 
 Expected parquet columns:
-  - title:          str   — news headline
-  - content:        str   — news body (optional)
-  - major_category: str   — level-1 category label (e.g. "科技信息")
-  - sentiment:      int or str — 0/negative=negative, 1/neutral=neutral, 2/positive=positive
+  - title:          str   -- news headline
+  - content:        str   -- news body (optional)
+  - major_category: str   -- level-1 category label
+  - sentiment:      int or str -- 0/negative, 1/neutral, 2/positive
 """
 
 from __future__ import annotations
@@ -36,14 +36,11 @@ L1_TO_IDX: dict[str, int] = {name: i for i, name in enumerate(L1_CATEGORIES)}
 IDX_TO_L1: dict[int, str] = {i: name for i, name in enumerate(L1_CATEGORIES)}
 
 SENTIMENT_STR_TO_INT: dict[str | int, int] = {
-    "利空": 0,
     "negative": 0,
     "bearish": 0,
     0: 0,
-    "中性": 1,
     "neutral": 1,
     1: 1,
-    "利好": 2,
     "positive": 2,
     "bullish": 2,
     2: 2,

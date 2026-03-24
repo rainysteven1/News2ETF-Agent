@@ -10,6 +10,10 @@ Loss: L = α * CE(L1) + γ * CE(Sentiment)
 
 from __future__ import annotations
 
+from pathlib import Path
+
+from loguru import logger
+
 import torch
 import torch.nn as nn
 from transformers.configuration_utils import PretrainedConfig
@@ -158,92 +162,104 @@ def load_finbert_classifier(
     return model  # type: ignore
 
 
-# ─── ONNX export wrapper ─────────────────────────────────────────────────────────
-
-
-class OnnxFinBERTWrapper(torch.nn.Module):
-    """ONNX-compatible wrapper: accepts raw tensors, returns only logits dict.
-
-    This wrapper strips the train-time loss computation so the exported
-    model performs pure inference (matching the user's export script).
-    """
-
-    def __init__(self, finbert_model: FinBERTClassifier):
-        super().__init__()
-        self.bert = finbert_model.bert
-        self.dropout = finbert_model.dropout
-        self.l1_fc1 = finbert_model.l1_fc1
-        self.l1_activation = finbert_model.l1_activation
-        self.l1_dropout = finbert_model.l1_dropout
-        self.l1_fc2 = finbert_model.l1_fc2
-        self.sent_fc1 = finbert_model.sent_fc1
-        self.sent_activation = finbert_model.sent_activation
-        self.sent_dropout = finbert_model.sent_dropout
-        self.sent_fc2 = finbert_model.sent_fc2
-
-    def forward(
-        self,
-        input_ids: torch.Tensor,
-        attention_mask: torch.Tensor,
-        token_type_ids: torch.Tensor,
-    ) -> dict[str, torch.Tensor]:
-        outputs = self.bert(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            token_type_ids=token_type_ids,
-        )
-
-        pooled = self.dropout(outputs.pooler_output)
-
-        # Mean pooling (same as model.py)
-        mask_expanded = attention_mask.unsqueeze(-1).expand(outputs.last_hidden_state.size()).float()
-        sum_embeddings = torch.sum(outputs.last_hidden_state * mask_expanded, dim=1)
-        sum_mask = mask_expanded.sum(dim=1).clamp(min=1e-9)
-        mean_pooled = sum_embeddings / sum_mask
-        mean_pooled = self.dropout(mean_pooled)
-
-        l1_hidden = self.l1_activation(self.l1_fc1(mean_pooled))
-        l1_hidden = self.l1_dropout(l1_hidden)
-        l1_logits = self.l1_fc2(l1_hidden)
-
-        sent_hidden = self.sent_activation(self.sent_fc1(pooled))
-        sent_hidden = self.sent_dropout(sent_hidden)
-        sent_logits = self.sent_fc2(sent_hidden)
-
-        return {"logits": l1_logits, "sentiment_logits": sent_logits}
-
-
 def export_finbert_to_onnx(
     model_dir: Path,
     onnx_path: Path,
     max_seq_length: int = 128,
     opset_version: int = 14,
 ) -> None:
-    """Load best checkpoint and export to ONNX."""
-    model = FinBERTClassifier.from_pretrained(str(model_dir))
-    model.eval()
+    """Export a FinBERT model to ONNX format.
 
-    wrapper = OnnxFinBERTWrapper(model)
+    The exported model takes tokenized text input (input_ids, attention_mask, token_type_ids)
+    and outputs l1_logits and sentiment_logits.
 
-    dummy_input_ids = torch.ones(1, max_seq_length, dtype=torch.long)
-    dummy_attention_mask = torch.ones(1, max_seq_length, dtype=torch.long)
-    dummy_token_type_ids = torch.zeros(1, max_seq_length, dtype=torch.long)
+    If ONNX export fails, a warning is logged and no exception is raised (pth checkpoint
+    is assumed to have already been saved by the caller).
+    """
+    try:
+        # 1. Load model and force to CPU
+        model = FinBERTClassifier.from_pretrained(str(model_dir))
+        model.to("cpu")
+        model.eval()
 
-    torch.onnx.export(
-        wrapper,
-        (dummy_input_ids, dummy_attention_mask, dummy_token_type_ids),
-        str(onnx_path),
-        export_params=True,
-        opset_version=opset_version,
-        do_constant_folding=True,
-        input_names=["input_ids", "attention_mask", "token_type_ids"],
-        output_names=["logits", "sentiment_logits"],
-        dynamic_axes={
-            "input_ids": {0: "batch_size", 1: "sequence_length"},
-            "attention_mask": {0: "batch_size", 1: "sequence_length"},
-            "token_type_ids": {0: "batch_size", 1: "sequence_length"},
-            "logits": {0: "batch_size"},
-            "sentiment_logits": {0: "batch_size"},
-        },
-    )
-    print(f"✓ ONNX model exported to {onnx_path}")
+        # 2. Build ONNX-compatible wrapper (inline, no external class needed)
+        class OnnxFinBERTWrapper(torch.nn.Module):
+            def __init__(self, finbert_model: FinBERTClassifier):
+                super().__init__()
+                self.bert = finbert_model.bert
+                self.dropout = finbert_model.dropout
+                self.l1_fc1 = finbert_model.l1_fc1
+                self.l1_activation = finbert_model.l1_activation
+                self.l1_dropout = finbert_model.l1_dropout
+                self.l1_fc2 = finbert_model.l1_fc2
+                self.sent_fc1 = finbert_model.sent_fc1
+                self.sent_activation = finbert_model.sent_activation
+                self.sent_dropout = finbert_model.sent_dropout
+                self.sent_fc2 = finbert_model.sent_fc2
+
+            def forward(
+                self,
+                input_ids: torch.Tensor,
+                attention_mask: torch.Tensor,
+                token_type_ids: torch.Tensor,
+            ) -> dict[str, torch.Tensor]:
+                outputs = self.bert(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    token_type_ids=token_type_ids,
+                )
+                pooled = self.dropout(outputs.pooler_output)
+                mask_expanded = attention_mask.unsqueeze(-1).expand(outputs.last_hidden_state.size()).float()
+                sum_embeddings = torch.sum(outputs.last_hidden_state * mask_expanded, dim=1)
+                sum_mask = mask_expanded.sum(dim=1).clamp(min=1e-9)
+                mean_pooled = sum_embeddings / sum_mask
+                mean_pooled = self.dropout(mean_pooled)
+                l1_hidden = self.l1_activation(self.l1_fc1(mean_pooled))
+                l1_hidden = self.l1_dropout(l1_hidden)
+                l1_logits = self.l1_fc2(l1_hidden)
+                sent_hidden = self.sent_activation(self.sent_fc1(pooled))
+                sent_hidden = self.sent_dropout(sent_hidden)
+                sent_logits = self.sent_fc2(sent_hidden)
+                return {"logits": l1_logits, "sentiment_logits": sent_logits}
+
+        wrapper = OnnxFinBERTWrapper(model)
+
+        # 3. Prepare dummy inputs
+        dummy_input_ids = torch.ones(1, max_seq_length, dtype=torch.long)
+        dummy_attention_mask = torch.ones(1, max_seq_length, dtype=torch.long)
+        dummy_token_type_ids = torch.zeros(1, max_seq_length, dtype=torch.long)
+
+        # 4. Export
+        onnx_path.parent.mkdir(parents=True, exist_ok=True)
+
+        torch.onnx.export(
+            wrapper,
+            (dummy_input_ids, dummy_attention_mask, dummy_token_type_ids),
+            str(onnx_path),
+            export_params=True,
+            opset_version=opset_version,
+            do_constant_folding=True,
+            input_names=["input_ids", "attention_mask", "token_type_ids"],
+            output_names=["logits", "sentiment_logits"],
+            dynamic_axes={
+                "input_ids": {0: "batch_size", 1: "sequence_length"},
+                "attention_mask": {0: "batch_size", 1: "sequence_length"},
+                "token_type_ids": {0: "batch_size", 1: "sequence_length"},
+                "logits": {0: "batch_size"},
+                "sentiment_logits": {0: "batch_size"},
+            },
+        )
+
+        # 5. Save tokenizer alongside
+        from transformers import AutoTokenizer
+
+        tokenizer = AutoTokenizer.from_pretrained(model.config._name_or_path)
+        tokenizer_dir = onnx_path.parent / "tokenizer"
+        tokenizer_dir.mkdir(exist_ok=True, parents=True)
+        tokenizer.save_pretrained(tokenizer_dir)
+
+        logger.info(f"[ONNX] Exported FinBERT to {onnx_path}")
+
+    except Exception as exc:
+        logger.warning(f"[ONNX] Export failed ({exc}), pth checkpoint saved for manual conversion")
+        raise

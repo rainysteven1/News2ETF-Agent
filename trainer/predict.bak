@@ -1,0 +1,342 @@
+"""Batch inference: FinBERT (major+sentiment) + SetFit (sub-category) ONNX.
+
+All configuration is read from config.toml — no CLI arguments.
+"""
+
+from __future__ import annotations
+
+import time
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+
+import numpy as np
+import onnxruntime as ort
+import polars as pl
+from loguru import logger
+from transformers import AutoTokenizer
+
+from trainer.finbert.dataset import L1_CATEGORIES, SENTIMENT_LABELS
+from trainer.setfit_module.model import LabelStats
+
+# ─── ONNX Helpers ────────────────────────────────────────────────────────────────
+
+
+def _make_ort_session(onnx_path: Path) -> ort.InferenceSession:
+    opts = ort.SessionOptions()
+    opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+    opts.intra_op_num_threads = 2
+    opts.inter_op_num_threads = 2
+    opts.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+    return ort.InferenceSession(str(onnx_path), opts, providers=["CPUExecutionProvider"])
+
+
+def _softmax(logits: np.ndarray) -> np.ndarray:
+    e = np.exp(logits - logits.max(axis=-1, keepdims=True))
+    return e / e.sum(axis=-1, keepdims=True)
+
+
+def _tokenize(texts: list[str], tokenizer: AutoTokenizer, max_length: int) -> dict[str, np.ndarray]:
+    inputs = tokenizer(
+        texts,
+        padding=True,
+        truncation=True,
+        max_length=max_length,
+        return_tensors="np",
+        num_workers=4,
+    )  # type: ignore
+    return {
+        "input_ids": inputs["input_ids"],
+        "attention_mask": inputs["attention_mask"],
+    }
+
+
+# ─── Async helpers ─────────────────────────────────────────────────────────────
+
+
+def _run_finbert_from_inputs(
+    sess: ort.InferenceSession,
+    inputs: dict[str, np.ndarray],
+) -> tuple[np.ndarray, np.ndarray]:
+    """Run FinBERT from pre-tokenized inputs; returns (l1_logits, sent_logits)."""
+    onnx_inputs = {
+        "input_ids": inputs["input_ids"].astype(np.int64),
+        "attention_mask": inputs["attention_mask"].astype(np.int64),
+        "token_type_ids": np.zeros_like(inputs["input_ids"]).astype(np.int64),
+    }
+    return sess.run(None, onnx_inputs)  # type: ignore[return-value]
+
+
+# ─── Main ──────────────────────────────────────────────────────────────────────
+
+
+def run() -> None:
+    from trainer.config import load_config
+
+    cfg = load_config()
+    p = cfg.predict
+
+    input_path = p.input_path
+    output_path = p.output_path
+    finbert_onnx_dir = p.finbert_onnx_dir
+    setfit_base_dir = p.setfit_base_dir
+    batch_size = p.batch_size
+    finbert_max_length = p.finbert_max_length
+    setfit_max_length = p.setfit_max_length
+
+    # ── 1. Load raw data ──────────────────────────────────────────────────────
+    assert input_path is not None and output_path is not None, "Input and output paths must be set in config.toml"
+    logger.info(f"[Predict] Loading raw data: {input_path}")
+    df_raw = pl.read_parquet(input_path)
+
+    required_cols = {"datetime", "title", "content"}
+    missing = required_cols - set(df_raw.columns)
+    if missing:
+        raise ValueError(f"Input parquet missing required columns: {missing}")
+
+    before = len(df_raw)
+    df_raw = df_raw.filter(df_raw["title"].is_not_null())
+    skipped = before - len(df_raw)
+    if skipped:
+        logger.warning(f"[Predict] Skipped {skipped} rows with null title")
+
+    if len(df_raw) == 0:
+        raise ValueError("No valid rows after filtering null titles")
+
+    df_raw = df_raw.sort("datetime")
+    n = len(df_raw)
+    logger.info(f"[Predict] {n} valid rows to process")
+
+    # ── 2. Load FinBERT ONNX ──────────────────────────────────────────────────
+    assert finbert_onnx_dir is not None, "FinBERT ONNX directory must be set in config.toml"
+    finbert_onnx_path = finbert_onnx_dir / "best.onnx"
+    finbert_tokenizer_path = finbert_onnx_dir / "tokenizer"
+
+    if not finbert_onnx_path.exists():
+        raise FileNotFoundError(f"FinBERT ONNX not found: {finbert_onnx_path}")
+    if not finbert_tokenizer_path.exists():
+        raise FileNotFoundError(f"FinBERT tokenizer not found: {finbert_tokenizer_path}")
+
+    logger.info(f"[Predict] Loading FinBERT ONNX: {finbert_onnx_path}")
+    finbert_sess = _make_ort_session(finbert_onnx_path)
+    finbert_tokenizer = AutoTokenizer.from_pretrained(str(finbert_tokenizer_path))
+
+    # ── 3. Load SetFit ONNX per major ────────────────────────────────────────
+    label_stats = LabelStats()
+    major_categories = label_stats.get_major_categories()
+    major_to_subcats: dict[str, list[str]] = {m: label_stats.get_sub_categories(m) for m in major_categories}
+
+    setfit_sessions: dict[str, ort.InferenceSession] = {}
+    setfit_tokenizers: dict[str, AutoTokenizer] = {}
+
+    assert setfit_base_dir is not None, "SetFit base directory must be set in config.toml"
+
+    for major in major_categories:
+        major_dir = setfit_base_dir / major
+        onnx_path = major_dir / "best.onnx"
+        tokenizer_path = major_dir / "tokenizer"
+
+        if not onnx_path.exists() or not tokenizer_path.exists():
+            logger.warning(f"[Predict] SetFit ONNX/tokenizer not found for '{major}'")
+            continue
+
+        logger.info(f"[Predict] Loading SetFit for '{major}'")
+        setfit_sessions[major] = _make_ort_session(onnx_path)
+        setfit_tokenizers[major] = AutoTokenizer.from_pretrained(str(tokenizer_path))
+
+    if not setfit_sessions:
+        raise RuntimeError("No SetFit ONNX models loaded")
+
+    # ── 4. Pre-compute texts (vectorized with Polars) ─────────────────────────
+    texts_for_finbert = (
+        df_raw.with_columns(
+            pl.when(pl.col("content").is_not_null() & pl.col("content").str.strip_chars() != "")
+            .then(
+                pl.concat_str(
+                    [
+                        pl.col("title"),
+                        pl.lit("[SEP]"),
+                        pl.col("content").str.slice(0, 256).cast(pl.Utf8),
+                    ]
+                )
+            )
+            .otherwise(pl.col("title"))
+            .alias("text")
+        )["text"]
+        .to_numpy()
+        .tolist()
+    )
+
+    # ── 5. Batch inference (async pipeline + parallel SetFit) ─────────────────
+    # Pre-allocate output arrays
+    majors_out = np.empty(n, dtype=object)
+    sents_out = np.empty(n, dtype=object)
+    l1_confs_out = np.empty(n, dtype=np.float64)
+    sent_confs_out = np.empty(n, dtype=np.float64)
+    sub_cats_out = np.empty(n, dtype=object)
+    sub_confs_out = np.empty(n, dtype=np.float64)
+
+    # Pre-tokenize first batch for FinBERT before entering loop
+    first_batch_end = min(batch_size, n)
+    current_finbert_inputs: dict[str, np.ndarray] = {}
+    if n > 0:
+        current_finbert_inputs = _tokenize(texts_for_finbert[0:first_batch_end], finbert_tokenizer, finbert_max_length)
+
+    logger.info(f"[Predict] Processing {n} rows, batch_size={batch_size}...")
+    t0 = time.monotonic()
+
+    SMALL_MAJOR_THRESHOLD = 4  # majors with fewer items processed serially
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        for start in range(0, n, batch_size):
+            end = min(start + batch_size, n)
+            batch_len = end - start
+
+            # Run FinBERT on current batch (from pre-tokenized inputs)
+            fb_future = executor.submit(_run_finbert_from_inputs, finbert_sess, current_finbert_inputs)
+
+            # Pre-tokenize next batch while FinBERT runs (swap to current for next iter)
+            next_start, next_end = end, min(end + batch_size, n)
+            if next_end > next_start:
+                current_finbert_inputs = _tokenize(
+                    texts_for_finbert[next_start:next_end],
+                    finbert_tokenizer,
+                    finbert_max_length,
+                )
+
+            l1_logits, sent_logits = fb_future.result()
+
+            # Post-process FinBERT outputs
+            l1_probs = _softmax(l1_logits)
+            l1_pred_idx = l1_probs.argmax(axis=1)
+            l1_conf = l1_probs[np.arange(len(l1_pred_idx)), l1_pred_idx]
+
+            sent_probs = _softmax(sent_logits)
+            sent_pred_idx = sent_probs.argmax(axis=1)
+            sent_conf = sent_probs[np.arange(len(sent_pred_idx)), sent_pred_idx]
+
+            batch_majors = [L1_CATEGORIES[i] for i in l1_pred_idx]
+            batch_sents = [SENTIMENT_LABELS[i] for i in sent_pred_idx]
+
+            # Group by major for SetFit routing
+            unique_majors: list[str] = []
+            major_to_local_idx: dict[str, list[int]] = {}
+            for local_idx, major in enumerate(batch_majors):
+                if major not in major_to_local_idx:
+                    major_to_local_idx[major] = []
+                    unique_majors.append(major)
+                major_to_local_idx[major].append(local_idx)
+
+            texts_per_major: dict[str, list[str]] = {m: [] for m in unique_majors}
+            for local_idx, major in enumerate(batch_majors):
+                texts_per_major[major].append(texts_for_finbert[start + local_idx])
+
+            # Pre-tokenize SetFit inputs once per unique major
+            setfit_tokenized: dict[str, dict[str, np.ndarray]] = {}
+            for major in unique_majors:
+                if major in setfit_sessions:
+                    setfit_tokenized[major] = _tokenize(
+                        texts_per_major[major],
+                        setfit_tokenizers[major],
+                        setfit_max_length,
+                    )
+
+            # Split majors: small (<threshold) → serial, large → parallel
+            small_majors = [m for m in unique_majors if len(major_to_local_idx[m]) < SMALL_MAJOR_THRESHOLD]
+            large_majors = [m for m in unique_majors if len(major_to_local_idx[m]) >= SMALL_MAJOR_THRESHOLD]
+
+            sub_pred_map: dict[str, tuple[list[int], list[float]]] = {}
+
+            # Serial SetFit for small majors (no thread overhead)
+            for major in small_majors:
+                if major not in setfit_sessions:
+                    fallback = (
+                        [len(major_to_subcats.get(major, ["其他"])) - 1] * len(major_to_local_idx[major]),
+                        [0.0] * len(major_to_local_idx[major]),
+                    )
+                    sub_pred_map[major] = fallback
+                else:
+                    inputs = setfit_tokenized[major]
+                    onnx_inputs = {
+                        "input_ids": inputs["input_ids"].astype(np.int64),
+                        "attention_mask": inputs["attention_mask"].astype(np.int64),
+                    }
+                    logits = setfit_sessions[major].run(None, onnx_inputs)[0]
+                    probs = _softmax(logits)
+                    pred_idx = probs.argmax(axis=1)
+                    conf = probs[np.arange(len(pred_idx)), pred_idx]
+                    sub_pred_map[major] = (pred_idx.tolist(), conf.tolist())
+
+            # Parallel SetFit for large majors
+            if large_majors:
+
+                def _run_setfit_for_major(major: str) -> tuple[str, tuple[list[int], list[float]]]:
+                    inputs = setfit_tokenized[major]
+                    onnx_inputs = {
+                        "input_ids": inputs["input_ids"].astype(np.int64),
+                        "attention_mask": inputs["attention_mask"].astype(np.int64),
+                    }
+                    logits = setfit_sessions[major].run(None, onnx_inputs)[0]
+                    probs = _softmax(logits)
+                    pred_idx = probs.argmax(axis=1)
+                    conf = probs[np.arange(len(pred_idx)), pred_idx]
+                    return major, (pred_idx.tolist(), conf.tolist())
+
+                futures = {executor.submit(_run_setfit_for_major, major): major for major in large_majors}
+                for future in futures:
+                    major, result = future.result()
+                    sub_pred_map[major] = result
+
+            # Fill missing majors with fallback
+            for major in unique_majors:
+                if major not in sub_pred_map:
+                    sub_pred_map[major] = (
+                        [len(major_to_subcats.get(major, ["其他"])) - 1] * len(major_to_local_idx[major]),
+                        [0.0] * len(major_to_local_idx[major]),
+                    )
+
+            # Assemble batch results into pre-allocated numpy arrays
+            batch_sub_cats_arr = np.empty(batch_len, dtype=object)
+            batch_sub_confs_arr = np.empty(batch_len, dtype=np.float64)
+
+            for major in unique_majors:
+                sub_idxs, sub_confs = sub_pred_map[major]
+                sub_cats = major_to_subcats.get(major, ["其他"])
+                local_indices = major_to_local_idx[major]
+
+                for local_idx, sub_idx, sub_conf in zip(local_indices, sub_idxs, sub_confs):
+                    safe_idx = min(sub_idx, len(sub_cats) - 1)
+                    batch_sub_cats_arr[local_idx] = sub_cats[safe_idx]
+                    batch_sub_confs_arr[local_idx] = float(sub_conf)
+
+            # Fill missing slots with default
+            for i in range(batch_len):
+                if batch_sub_cats_arr[i] == "":
+                    batch_sub_cats_arr[i] = "其他"
+                    batch_sub_confs_arr[i] = 0.0
+
+            # Write directly into pre-allocated output arrays
+            majors_out[start:end] = batch_majors
+            sents_out[start:end] = batch_sents
+            l1_confs_out[start:end] = l1_conf
+            sent_confs_out[start:end] = sent_conf
+            sub_cats_out[start:end] = batch_sub_cats_arr
+            sub_confs_out[start:end] = batch_sub_confs_arr
+
+            if (end % (batch_size * 20) == 0) or end == n:
+                elapsed = time.monotonic() - t0
+                rows_per_sec = end / elapsed if elapsed > 0 else 0
+                logger.info(f"  Processed {end}/{n}  ({rows_per_sec:.0f} rows/s)")
+
+    # ── 6. Build output (numpy arrays passed directly to Polars) ──────────────
+    result_df = df_raw.with_columns(
+        pl.Series("major_category", majors_out),
+        pl.Series("sentiment", sents_out),
+        pl.Series("sub_category", sub_cats_out),
+        pl.Series("l1_confidence", l1_confs_out),
+        pl.Series("sentiment_confidence", sent_confs_out),
+        pl.Series("sub_category_confidence", sub_confs_out),
+    ).sort("datetime")
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    result_df.write_parquet(output_path)
+    logger.success(f"[Predict] Saved {len(result_df)} labeled rows → {output_path}")
