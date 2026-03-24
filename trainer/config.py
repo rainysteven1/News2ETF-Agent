@@ -92,12 +92,15 @@ class SetFitModelConfig(BaseModel):
     """SetFit 模型超参."""
 
     pretrained_model: str = "sentence-transformers/paraphrase-multilingual-mpnet-base-v2"
+    label_stats: Path = _ROOT / "label_stats.json"
+    max_seq_length: int = 256
 
 
 class SetFitTrainingConfig(BaseModel):
     """SetFit 训练超参."""
 
     raw_data_path: Path | None = None
+    output_dir: Path | None = None
     test_size: float = 0.2
     seed: int = 42
     batch_size: int = 16

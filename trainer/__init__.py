@@ -9,21 +9,24 @@ from trainer.config import (
     FinBERTTrainingConfig,
     SignalsTrainingConfig,
     TrainerConfig,
+)
+from trainer.config import (
     load_config as load_trainer_config,
 )
 from trainer.finbert import (
-    FinBERTClassifier,
-    FinBERTClassifierConfig,
     IDX_TO_L1,
     L1_CATEGORIES,
     L1_TO_IDX,
+    SENTIMENT_LABELS,
+    FinBERTClassifier,
+    FinBERTClassifierConfig,
     NewsClassificationDataset,
     NewsInferenceDataset,
-    SENTIMENT_LABELS,
     load_finbert_classifier,
     preprocess_split,
     train_finbert,
 )
+from trainer.setfit import train_per_major
 from trainer.signals.models import LSTMWithAttention
 from trainer.signals.train import (
     build_lgbm_features,
@@ -34,12 +37,6 @@ from trainer.signals.train import (
     train_lstm_attention_pretrain,
 )
 from trainer.wandb_handler import WandbHandler
-from trainer.setfit import (
-    get_major_categories,
-    get_sub_categories,
-    load_label_stats,
-    train_per_major,
-)
 
 __all__ = [
     # Config
@@ -72,8 +69,5 @@ __all__ = [
     "preprocess_split",
     "train_finbert",
     # SetFit
-    "get_major_categories",
-    "get_sub_categories",
-    "load_label_stats",
     "train_per_major",
 ]

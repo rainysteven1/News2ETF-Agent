@@ -53,15 +53,18 @@ fp16 = true
 seed = 42
 use_content = true
 
+[setfit.model]
+pretrained_model = "./trainer/data/pretrained_models/text2vec-base-chinese"
+label_stats = "./trainer/data/labeled/setfit/label_stats.json"
+max_seq_length = 256
+
 [setfit.training]
-raw_data_path = "./data/labeled/raw.parquet"
+raw_data_path = "./trainer/data/labeled/setfit/raw.parquet"
+output_dir = "./trainer/checkpoints/setfit"
 test_size = 0.2
-seed = 42
 batch_size = 16
 num_iterations = 20
-num_epochs = 1
+num_epochs = 3
 learning_rate = 2e-5
 min_samples_per_class = 2
-
-[setfit.model]
-pretrained_model = "./data/pretrained_models/text2vec-base-chinese "
+seed = 42

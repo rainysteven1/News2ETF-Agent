@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import gc
 import json
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -19,8 +20,11 @@ from loguru import logger
 from sentence_transformers.losses import CosineSimilarityLoss
 from setfit import SetFitModel, SetFitTrainer
 
+from trainer.config import SetFitModelConfig, SetFitTrainingConfig
 from trainer.config import load_config as load_trainer_config
-from trainer.setfit.model import _safe_name, get_major_categories
+from trainer.setfit.model import LabelStats, _safe_name, export_setfit_to_onnx
+from trainer.utils.seed import set_seed
+from trainer.wandb_handler import WandbHandler
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -60,10 +64,10 @@ def train_setfit_for_major(
     df: pl.DataFrame,
     major: str,
     output_dir: Path,
-    mcfg: Any,
-    tcfg: Any,
+    mcfg: SetFitModelConfig,
+    tcfg: SetFitTrainingConfig,
     device: torch.device,
-    wb: Any,
+    wb: WandbHandler,
 ) -> dict[str, Any]:
     """Train and save a SetFit model for one major category. Returns metrics."""
     logger.info(f"[SetFit] Training for major: {major}")
@@ -78,7 +82,7 @@ def train_setfit_for_major(
     num_iters = _adaptive_num_iterations(n_samples, tcfg.num_iterations)
 
     try:
-        train_ds = dataset.train_test_split(test_size=tcfg.test_size, seed=tcfg.seed, stratify="label")
+        train_ds = dataset.train_test_split(test_size=tcfg.test_size, seed=tcfg.seed, stratify_by_column="label")
     except Exception:
         train_ds = dataset.train_test_split(test_size=tcfg.test_size, seed=tcfg.seed)
 
@@ -109,39 +113,71 @@ def train_setfit_for_major(
     metrics = trainer.evaluate()
     logger.info(f"[SetFit] {major} — samples={n_samples}, iters={num_iters}, metrics={metrics}")
 
+    accuracy = float(metrics.get("accuracy", 0))
+    f1 = float(metrics.get("f1", 0))
+
     wb.log_epoch(
         "setfit",
         1,
-        float(metrics.get("accuracy", 0)),
+        accuracy,
         {
-            "f1": float(metrics.get("f1", 0)),
+            "f1": f1,
             "samples": n_samples,
             "num_iterations": num_iters,
         },
     )
 
-    # ── Save ──────────────────────────────────────────────────────────────────
-    major_dir = Path(output_dir) / _safe_name(major)
-    model.save(str(major_dir))
+    # ── Save best model ───────────────────────────────────────────────────────
+    best_dir = output_dir / "best"
+
+    # Always save the trained model as "best" (SetFitTrainer trains once per run,
+    # so this IS the best we've got for this major category)
+    model.save_pretrained(str(best_dir))
 
     # Save label list alongside (id2label order)
-    with open(major_dir / "label_map.json", "w", encoding="utf-8") as f:
+    with open(best_dir / "label_map.json", "w", encoding="utf-8") as f:
         json.dump(unique_labels, f, ensure_ascii=False, indent=2)
 
-    logger.success(f"[SetFit] {major} saved to {major_dir}")
-    return {"major": major, "status": "ok", "metrics": metrics, "output_dir": str(major_dir)}
+    logger.success(f"[SetFit] {major} best model saved to {best_dir} (accuracy={accuracy:.4f}, f1={f1:.4f})")
+
+    # ── Export best model to ONNX ──────────────────────────────────────────────
+    onnx_path = output_dir / "best.onnx"
+    try:
+        export_setfit_to_onnx(model_dir=best_dir, onnx_path=onnx_path, max_seq_length=mcfg.max_seq_length or 256)
+
+        # ── Upload ONNX as W&B artifact ──────────────────────────────────────
+        wb.upload_artifact(
+            artifact_path=onnx_path,
+            name=f"setfit-onnx-{_safe_name(major)}",
+            artifact_type="model",
+            aliases=["best"],
+        )
+        onnx_status = "exported"
+    except Exception as e:
+        logger.warning(
+            f"[SetFit] ONNX export failed for {major}: {e}, pth checkpoint saved at {best_dir} for manual conversion"
+        )
+        onnx_path = None
+        onnx_status = "failed"
+
+    wb.log_summary({"best_accuracy": accuracy, "best_f1": f1})
+
+    return {
+        "major": major,
+        "status": "ok",
+        "metrics": metrics,
+        "accuracy": accuracy,
+        "f1": f1,
+        "output_dir": str(best_dir),
+        "onnx_path": str(onnx_path) if onnx_path else None,
+        "onnx_status": onnx_status,
+    }
 
 
 # ─── Main training ───────────────────────────────────────────────────────────
 
 
-def train_per_major(
-    data_path: Path | None = None,
-    output_dir: Path | None = None,
-    model_config: Any | None = None,
-    training_config: Any | None = None,
-    wandb_project: str | None = None,
-) -> dict[str, dict[str, Any]]:
+def train_per_major() -> dict[str, dict[str, Any]]:
     """Train one SetFit model per major category.
 
     Returns dict mapping major category -> metrics/results.
@@ -149,37 +185,38 @@ def train_per_major(
     GPU memory is released after each major to avoid OOM.
     """
     cfg = load_trainer_config()
-    mcfg = model_config or cfg.setfit
-    tcfg = training_config or cfg.setfit_training
 
-    if data_path is None:
-        if tcfg.raw_data_path is None:
-            raise ValueError(
-                "data_path must be provided either as argument or via "
-                "config.toml [setfit.training] raw_data_path"
-            )
-        data_path = tcfg.raw_data_path
+    mcfg = cfg.setfit
+    tcfg = cfg.setfit_training
+    wcfg = cfg.wandb
 
-    output_dir = output_dir or Path("checkpoints/setfit")
-    wb_project = wandb_project or cfg.wandb.project
-    output_dir.mkdir(parents=True, exist_ok=True)
-
+    set_seed(tcfg.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    logger.info(f"[SetFit] Device: {device}")
 
+    data_path = tcfg.raw_data_path if tcfg.raw_data_path else (Path("data/labeled/raw.parquet"))
     df = pl.read_parquet(data_path)
     logger.info(f"[SetFit] Loaded {len(df)} rows from {data_path}")
 
+    run_prefix = f"setfit-{datetime.now():%m%d-%H%M}"
+    run_prefix_dir = (
+        Path(tcfg.output_dir) / run_prefix if tcfg.output_dir else Path("trainer/checkpoints/setfit") / run_prefix
+    )
+    run_prefix_dir.mkdir(parents=True, exist_ok=True)
+
     results = {}
-    for major in get_major_categories():
+    for major in LabelStats().get_major_categories():
         major_count = len(df.filter(pl.col("major_category") == major))
         logger.info(f"[SetFit] Major '{major}': {major_count} rows")
 
-        from trainer.wandb_handler import WandbHandler
+        run_name = f"{run_prefix}-{_safe_name(major)}"
+        run_output_dir = run_prefix_dir / _safe_name(major)
+        run_output_dir.mkdir(parents=True, exist_ok=True)
 
         wb = WandbHandler(
-            project=wb_project,
-            entity=cfg.wandb.entity,
-            name=major,
+            project=wcfg.project,
+            entity=wcfg.entity,
+            name=run_name,
             config_dict={
                 "pretrained_model": mcfg.pretrained_model,
                 "batch_size": tcfg.batch_size,
@@ -191,7 +228,7 @@ def train_per_major(
             mode=cfg.wandb.mode,
         )
 
-        result = train_setfit_for_major(df, major, output_dir, mcfg, tcfg, device, wb)
+        result = train_setfit_for_major(df, major, run_output_dir, mcfg, tcfg, device, wb)
         results[major] = result
         wb.finish()
 
@@ -202,7 +239,7 @@ def train_per_major(
             torch.cuda.empty_cache()
 
     # Save summary
-    summary_path = output_dir / "training_summary.json"
+    summary_path = run_prefix_dir / "training_summary.json"
     with open(summary_path, "w", encoding="utf-8") as f:
         json.dump(results, f, ensure_ascii=False, indent=2)
 
