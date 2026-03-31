@@ -107,12 +107,30 @@ class DataConfig(BaseModel):
     end_date: str = "2024-12-31"
 
 
+class PredictConfig(BaseModel):
+    finbert_onnx_dir: Path = _ROOT / "trainer" / "checkpoints" / "finbert"
+    finbert_max_length: int = 128
+    batch_size: int = 64
+    setfit_base_dir: Path = _ROOT / "trainer" / "checkpoints" / "setfit"
+    setfit_max_length: int = 256
+    onnx_cache_dir: Path = _ROOT / "data" / "onnx_cache"
+    max_cache_weeks: int = 4
+
+
+class MemosConfig(BaseModel):
+    """Memos API configuration for historical memory retrieval."""
+    api_key: str = ""
+    base_url: str = "https://memos.memtensor.cn/api/openmem/v1"
+
+
 class AgentRootConfig(BaseModel):
     model: ModelConfig = ModelConfig()
     agent: AgentConfig = AgentConfig()
     backtest: BacktestConfig = BacktestConfig()
     data: DataConfig = DataConfig()
     training_finbert: FinBERTTrainingConfig = FinBERTTrainingConfig()
+    predict: PredictConfig = PredictConfig()
+    memos: MemosConfig = MemosConfig()
 
 
 def load_config(path: Path | str | None = None) -> AgentRootConfig:
@@ -140,5 +158,11 @@ def load_config(path: Path | str | None = None) -> AgentRootConfig:
     ):
         if key in data_section:
             raw["data"][key] = str(_ROOT / data_section[key])
+
+    # Resolve predict section paths
+    predict_section = raw.get("predict", {})
+    for key in ("finbert_onnx_dir", "setfit_base_dir", "onnx_cache_dir"):
+        if key in predict_section:
+            raw["predict"][key] = str(_ROOT / predict_section[key])
 
     return AgentRootConfig.model_validate(raw)

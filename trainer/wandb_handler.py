@@ -17,9 +17,8 @@ import os
 from pathlib import Path
 from typing import Any
 
-from loguru import logger
-
 import wandb
+from loguru import logger
 
 
 def _build_lstm_config_dict(cfg: Any) -> dict[str, Any]:

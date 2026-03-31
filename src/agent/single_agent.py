@@ -189,6 +189,11 @@ def decide_node(state: AgentState, config: AgentRootConfig) -> dict:
                                         "action": {"type": "string", "enum": ["buy", "sell", "hold"]},
                                         "weight": {"type": "number", "minimum": 0.0, "maximum": 1.0},
                                         "reason": {"type": "string"},
+                                        "selected_indices": {
+                                            "type": "array",
+                                            "items": {"type": "string"},
+                                        },
+                                        "selected_etf": {"type": "string"},
                                     },
                                     "required": ["industry", "action", "weight", "reason"],
                                 },
@@ -201,7 +206,18 @@ def decide_node(state: AgentState, config: AgentRootConfig) -> dict:
             },
         )
         data = json.loads(result) if isinstance(result, str) else result
-        decisions = [TradeDecision(**d) for d in data.get("decisions", [])]
+        raw_decisions = data.get("decisions", [])
+        decisions = [
+            TradeDecision(
+                industry=d["industry"],
+                action=d["action"],
+                weight=d["weight"],
+                reason=d.get("reason", ""),
+                selected_indices=d.get("selected_indices", []),
+                selected_etf=d.get("selected_etf", ""),
+            )
+            for d in raw_decisions
+        ]
     except Exception:
         # Fallback: plain JSON
         try:
@@ -210,7 +226,21 @@ def decide_node(state: AgentState, config: AgentRootConfig) -> dict:
                 lines = text.split("\n")
                 text = "\n".join(lines[1:-1])
             data = json.loads(text)
-            decisions = [TradeDecision(**d) for d in data] if isinstance(data, list) else []
+            if isinstance(data, dict):
+                raw_decisions = data.get("decisions", [])
+                decisions = [
+                    TradeDecision(
+                        industry=d["industry"],
+                        action=d["action"],
+                        weight=d["weight"],
+                        reason=d.get("reason", ""),
+                        selected_indices=d.get("selected_indices", []),
+                        selected_etf=d.get("selected_etf", ""),
+                    )
+                    for d in raw_decisions
+                ]
+            elif isinstance(data, list):
+                decisions = [TradeDecision(**d) for d in data]
         except Exception:
             decisions = []
 
@@ -349,6 +379,11 @@ def trader_retry_node(state: AgentState, config: AgentRootConfig) -> dict:
                                         "action": {"type": "string", "enum": ["buy", "sell", "hold"]},
                                         "weight": {"type": "number", "minimum": 0.0, "maximum": 1.0},
                                         "reason": {"type": "string"},
+                                        "selected_indices": {
+                                            "type": "array",
+                                            "items": {"type": "string"},
+                                        },
+                                        "selected_etf": {"type": "string"},
                                     },
                                     "required": ["industry", "action", "weight", "reason"],
                                 },
@@ -361,7 +396,18 @@ def trader_retry_node(state: AgentState, config: AgentRootConfig) -> dict:
             },
         )
         data = json.loads(result) if isinstance(result, str) else result
-        decisions = [TradeDecision(**d) for d in data.get("decisions", [])]
+        raw_decisions = data.get("decisions", [])
+        decisions = [
+            TradeDecision(
+                industry=d["industry"],
+                action=d["action"],
+                weight=d["weight"],
+                reason=d.get("reason", ""),
+                selected_indices=d.get("selected_indices", []),
+                selected_etf=d.get("selected_etf", ""),
+            )
+            for d in raw_decisions
+        ]
     except Exception:
         try:
             text = client.chat("", prompt).strip()
@@ -369,7 +415,21 @@ def trader_retry_node(state: AgentState, config: AgentRootConfig) -> dict:
                 lines = text.split("\n")
                 text = "\n".join(lines[1:-1])
             data = json.loads(text)
-            decisions = [TradeDecision(**d) for d in data] if isinstance(data, list) else []
+            if isinstance(data, dict):
+                raw_decisions = data.get("decisions", [])
+                decisions = [
+                    TradeDecision(
+                        industry=d["industry"],
+                        action=d["action"],
+                        weight=d["weight"],
+                        reason=d.get("reason", ""),
+                        selected_indices=d.get("selected_indices", []),
+                        selected_etf=d.get("selected_etf", ""),
+                    )
+                    for d in raw_decisions
+                ]
+            elif isinstance(data, list):
+                decisions = [TradeDecision(**d) for d in data]
         except Exception:
             decisions = []
 
@@ -410,6 +470,15 @@ def risk_check_node(state: AgentState, config: AgentRootConfig, mapper=None) -> 
         }
 
     errors = []
+    adjusted_decisions: list[TradeDecision] = []
+
+    # ── Rule 6: Minimum operation threshold ─────────────────────────────────────
+    for d in decisions:
+        if d.action == "buy" and 0 < d.weight < 0.05:
+            errors.append(f"[{d.industry}] weight {d.weight:.3f} < 0.05 (min threshold) — downgraded to HOLD")
+        else:
+            adjusted_decisions.append(d)
+    decisions = adjusted_decisions
 
     # ── Basic weight constraints ───────────────────────────────────────────────
     for d in decisions:

@@ -10,6 +10,8 @@ class TradeDecision(BaseModel):
     action: str  # "buy", "sell", "hold"
     weight: float = Field(ge=0.0, le=1.0)
     reason: str = ""
+    selected_indices: list[str] = Field(default_factory=list)
+    selected_etf: str = ""
 
 
 class AgentState(TypedDict):

@@ -1,216 +1,199 @@
-# Plan: 新闻量化交易 Agent 系统
+# Plan: LLM 驱动的行业轮动 + ETF 智能选择
 
 ## Context
 
-用户决定**完全重启项目**，抛弃原有的：
-- `src/` - FastAPI 后端 + 分类 pipeline
-- `finbert/` - FinBERT ML 训练
-- `agent/` - 旧的 feat/agent 分支
+用户确认：**LLM 做真正的行业判断，不是规则引擎**。规则只做 Guardrail。
 
-新项目的目标：**训练一个像人类操盘手的 Agent，直接看原始新闻+ETF走势决定买哪只ETF**。
+现有 pipeline 已完成：
+- Raw新闻 → FinBERT+SetFit ONNX → 大类行业/细分行业/情感标签（已缓存）
+- `get_onnx_predictions()` 提供每条新闻的三重标签
 
-核心变化：从"新闻分类系统"变成"端到端量化交易 Agent"。
+ML Pipeline（用户当前制作数据集中）：
+```
+情感时序 → TCN → 动量分数 [-1, 1]（主要信号）
+新闻量时序 → Isolation Forest → 热度异常 [0, 1]
+上述特征 → LightGBM → 综合信号
+可选: GNN → 跨行业传导（油价→新能源）
+```
+
+**情感聚合粒度**：按 `sub_category`（47个细分），不是 `major_category`（8个大类）
+
+**LLM 决策流程**（两层选择）：
+1. 行业信号 + 新闻摘要 → LLM 判断"哪些行业值得配置 + 权重"
+2. 行业 → LLM 选择 top 跟踪指数 → 再选具体 ETF（看规模/管理人/基准）
 
 ---
 
-## 最终项目结构
+## LLM 决策输入设计
 
+### 信息压缩策略
+
+原始新闻 3000 条 → 每行业 top 3-5 条摘要（按置信度排序）
+
+**摘要格式**（每条 ~50-80 tokens）：
 ```
-News2ETF-Engine/
-├── src/                          # 所有代码统一放这里
-│   ├── agent/                    # Agent 核心
-│   │   ├── single_agent.py       # 单 Agent ReAct 实现
-│   │   ├── state.py              # Agent State 定义
-│   │   ├── prompts.py            # ReAct 引导 prompt
-│   │   └── workflow.py           # LangGraph workflow
-│   ├── skills/                   # LangChain Tools/Skills
-│   │   ├── __init__.py
-│   │   ├── market_news.py        # read_market_news
-│   │   ├── ml_signals.py         # compute_ml_signals
-│   │   ├── last_week_pnl.py      # check_last_week_pnl
-│   │   ├── history_retrieval.py  # retrieve_history
-│   │   ├── decision.py           # decide_positions
-│   │   └── trade_execute.py      # execute_trade
-│   ├── backtest/                 # 回测引擎
-│   │   ├── engine.py             # 周粒度 WalkForward
-│   │   ├── portfolio.py          # 持仓+收益计算
-│   │   └── metrics.py            # 指标计算
-│   ├── signals/                  # ML 信号层
-│   │   ├── raw_scorer.py         # CPU/GPU 自适应
-│   │   ├── knowledge_retrieval.py # TF-IDF 相似检索
-│   │   └── weekly_returns.py     # 每周收益计算
-│   └── utils/                    # 工具函数
-│       ├── device.py              # CUDA/CPU 检测
-│       ├── sentiment_cpu.py       # 关键词情感规则
-│       ├── price_features.py       # ETF 价格特征
-│       └── industry_map.py         # 行业→ETF 映射
-├── data/                         # 原始数据（保留）
-│   ├── converted/                 # tushare_news_*.parquet
-│   └── 主题ETF历史量价.parquet     # ETF 价格
-├── docs/
-├── pyproject.toml
-└── README.md
+[情感] 置信度 | 标题（50字内） | 关键词1, 关键词2
 ```
 
----
-
-## 核心架构
-
-### 周粒度 Walk-Forward + ReAct Agent
-
+**LLM 完整输入结构**：
 ```
-每周收盘后:
-┌─────────────────────────────────────────────────────────────┐
-│  Week N 输入                                               │
-│  - 原始新闻 (tushare_news_*.parquet)                       │
-│  - ETF 价格 (主题ETF历史量价.parquet)                       │
-│  - ★ 上周持仓 + 收益率 (行为记忆)                          │
-└─────────────────────────────────────────────────────────────┘
-                            │
-                            ▼
-┌─────────────────────────────────────────────────────────────┐
-│  ReAct Agent (LLM 大脑)                                     │
-│                                                             │
-│  LLM: "先看新闻"  → read_market_news()                     │
-│  LLM: "再看指标"  → compute_ml_signals()                    │
-│  LLM: "看上周盈亏" → check_last_week_pnl()                 │
-│  LLM: "查历史案例" → retrieve_history()                     │
-│  LLM: "做决策"    → decide_positions()                     │
-│                 → execute_trade()                          │
-└─────────────────────────────────────────────────────────────┘
-                            │
-                            ▼
-┌─────────────────────────────────────────────────────────────┐
-│  回测引擎 → 计算周收益 → 存 weekly_returns.parquet          │
-└─────────────────────────────────────────────────────────────┘
-                            │
-                            ▼
-                        Week N+1
+## 行业综合信号（LightGBM 输出）
+- 大类A/细分A: 综合=0.65, 动量=0.42, 热度=0.65, 趋势=1
+- 大类A/细分B: 综合=-0.30, 动量=-0.15, 热度=0.30, 趋势=0
+...
+
+## 历史动量轨迹（TCN，近4周）
+- 大类A/细分A: [0.20, 0.30, 0.35, 0.42]  ← 持续上行
+- 大类A/细分B: [0.10, 0.05, -0.10, -0.15] ← 持续下行
+...
+
+## 高置信度新闻摘要（每细分 top 3）
+### 大类A/细分A（银行）
+- [positive] 0.92 | 国有大行下调存款利率... | 降息, 银行, 存款
+- [positive] 0.88 | 银行板块集体拉升... | 银行, 券商
+...
+
+### 大类A/细分B（半导体）
+- [negative] 0.78 | 美国扩大芯片出口管制... | 半导体, 出口管制
+...
+
+## 可选 ETF 列表（该细分下所有 ETF）
+| ETF代码 | 名称 | 跟踪指数 | 规模(亿) | 管理人 | 基准误差 |
+|---------|------|----------|----------|--------|----------|
+| 512800 | 华夏银行ETF | 中证银行指数 | 45.2 | 华夏基金 | 0.02% |
+| 159887 | 银行ETF | 沪深300银行分指数 | 12.1 | 广发基金 | 0.05% |
+...
+
+## 当前持仓
+上周持仓: 大类A/细分A 30%, 大类B/细分C 25%
+上周收益: +2.3%
+已投权重: 55%
 ```
 
 ---
 
-## 关键设计决策
+## LLM 决策输出格式
 
-### 1. 完全新建，不基于旧代码
-feat/agent 分支的设计思路保留，但代码完全重写。
-
-### 2. GPU 解耦
-```python
-device = "cuda" if torch.cuda.is_available() else "cpu"
+```json
+{
+  "weekly_plan": [
+    {
+      "industry": "大类A/细分A",
+      "action": "buy",
+      "weight": 0.25,
+      "selected_indices": ["中证银行指数"],
+      "selected_etf": "512800 华夏银行ETF",
+      "reason": "动量持续上行4周，新闻高置信度正面，存款降息利好持续"
+    },
+    {
+      "industry": "大类A/细分B",
+      "action": "sell",
+      "weight": 0.15,
+      "selected_indices": [],
+      "selected_etf": null,
+      "reason": "动量连续下行，出口管制压力持续"
+    }
+  ]
+}
 ```
-无 GPU 时用规则替代 ML 模型，本地能测试。
 
-### 3. Skill/Tool 化
-每个能力是 `@tool` 装饰的 LangChain function，LLM 需要什么就 call 什么。
+---
 
-### 4. 训练/测试分离
+## Guardrail 规则（规则引擎校验，非 LLM 决策）
+
+1. **单行业权重上限**: 30%
+2. **总权重上限**: 100%
+3. **Beta 惩罚**: very_high beta 仓位 ×0.7；high beta ×0.85
+4. **Mirror 检查**: 同 correlation_cluster 的两个行业不能同时权重 ≥ 15%
+5. **亏损保护**: 上周 return < 0 时，禁止新建 very_high beta 仓位
+6. **最小操作阈值**: 权重变化 < 5% → 降为 HOLD（不值得手续费）
+
+---
+
+## 数据准备需求
+
+### 1. 情感时序（TCN 输入）
+
 ```
-训练期: 2021-01 ~ 2022-06  (调参用)
-测试期: 2022-07 ~ 2023-12  (最终评估)
+日期 | 行业 | 情感均值 | 情感std | 新闻数量 | 平均置信度
 ```
 
-### 5. 行为金融记忆
-Agent 决策时知道：上周持仓、收益率、赚钱/亏损状态 → 模拟"跟涨杀跌"心理。
+**情感分数**：sentiment_score = 1/0/-1 (positive/neutral/negative) × l1_confidence
+
+**TCN 输出**：动量分数 [-1, 1]，捕捉情感上升/下降趋势
+
+### 2. 新闻量时序（Isolation Forest 输入）
+```
+日期 | 行业 | 当日新闻数量 | 近5日均值 | 近5日std
+```
+
+### 3. ETF 元信息表
+```
+ETF代码 | 名称 | 跟踪指数 | 规模 | 管理人 | 业绩基准 | 跟踪误差
+```
+
+### 4. 行业-指数-ETF 映射（IndustryMapper，已有）
+- 大类 → 细分 → 跟踪指数 → best ETF
 
 ---
 
 ## 实现步骤
 
-### Step 1: 项目骨架 + GPU 解耦 (2h)
-- 创建 `src/` 目录结构
-- `src/utils/device.py` - CUDA/CPU 自动检测
-- `src/utils/sentiment_cpu.py` - 关键词情感规则
-- `src/utils/price_features.py` - ETF 价格特征
-- `src/utils/industry_map.py` - 行业→ETF 映射
-- **验证**：`python -c "from src.utils import *; print('OK')"` 无 GPU 也能过
+### Phase 1: 数据基础设施（用户当前在做的）
 
-### Step 2: 回测引擎骨架 (2h)
-- `src/backtest/engine.py` - 周粒度 WalkForwardEngine
-- `src/backtest/portfolio.py` - 持仓+周度收益
-- `src/backtest/metrics.py` - Sharpe/Calmar/最大回撤
-- **验证**：`python -c "from src.backtest import *; print('OK')"`
+- [ ] 构建情感时序 DataFrame（按行业+日期聚合）
+- [ ] 构建新闻量时序 DataFrame
+- [ ] 训练 TCN 模型（动量信号）
+- [ ] 训练 Isolation Forest（热度信号）
+- [ ] 训练 LightGBM（综合信号）
+- [ ] ONNX 导出并集成到 `compute_ml_signals`
 
-### Step 3: 行为记忆层 (1h)
-- `src/signals/weekly_returns.py`
-- 计算每周持仓行业的收益率
-- **验证**：能读写 `data/weekly_returns.parquet`
+### Phase 2: LLM 决策输入工具
 
-### Step 4: 知识检索层 (3h)
-- `src/signals/knowledge_retrieval.py`
-- TF-IDF 对历史新闻建索引
-- 给定日期返回相似历史案例
-- **验证**：能返回相似新闻+当时市场反应
+- [ ] 新建 `build_decision_context(date)` 函数
+  - 聚合行业信号（从 LightGBM 输出）
+  - 拉取历史动量轨迹
+  - 压缩新闻摘要（每行业 top 3）
+  - 拉取候选 ETF 列表（按细分行业）
+  - 拉取当前持仓
 
-### Step 5: ML 信号层（GPU 可选） (2h)
-- `src/signals/raw_scorer.py`
-- CPU 模式：规则替代
-- GPU 模式：LSTM/IForest/LightGBM
-- **验证**：CPU 模式出结果
+- [ ] 新增 `get_industry_top_news(date, industry, top_k=3)` 工具
+  - 从 `get_onnx_predictions` 缓存按置信度排序取 top-k
 
-### Step 6: Skill 定义 (2h)
-- `src/skills/market_news.py`
-- `src/skills/ml_signals.py`
-- `src/skills/last_week_pnl.py`
-- `src/skills/history_retrieval.py`
-- `src/skills/decision.py`
-- `src/skills/trade_execute.py`
-- **验证**：`from src.skills import *; print('OK')`
+- [ ] 新增 `get_etf_candidates(industry)` 工具
+  - 从 IndustryMapper 获取该行业所有跟踪指数
+  - 从 ETF info 表拉取每只 ETF 的规模/管理人/基准/误差
 
-### Step 7: Agent ReAct 实现 (3h)
-- `src/agent/state.py` - State 定义
-- `src/agent/prompts.py` - ReAct 引导
-- `src/agent/single_agent.py` - ReAct 循环
-- `src/agent/workflow.py` - LangGraph workflow
-- **验证**：`python -m src.agent.decide --week 2023-06-15` 单周能跑
+### Phase 3: decide_node 重构
 
-### Step 8: 端到端回测 (2h)
-- 完整周粒度回测
-- 训练期/测试期分离
-- **验证**：Sharpe、Calmar、最大回撤指标
+- [ ] 修改 `decide_node` 调用 `build_decision_context()`
+- [ ] Prompt 改为明确告诉 LLM：基于信号+摘要+趋势做判断
+- [ ] 输出格式严格匹配 `TradeDecision` 模型
+
+### Phase 4: Guardrail 集成
+
+- [ ] 在 `risk_check_node` 前增加 `guardrail_node`
+- [ ] 实现上述 6 条规则
+- [ ] 违规时返回修改建议（而不是拒绝）
 
 ---
 
-## 验证方法
+## 关键文件
 
-### 本地（无 GPU）
-```bash
-# 基础验证
-python -c "from src.skills import *; from src.signals.raw_scorer import *; print('OK')"
-
-# 单周 debug
-python -m src.agent.decide --week 2023-06-15
-
-# CPU 模式回测
-python -m src.agent.backtest --train-end 2022-06-30 --test-start 2022-07-01 --end 2022-12-31
-```
-
-### 服务器（有 GPU）
-```bash
-# 全量训练期回测
-python -m src.agent.backtest --train-end 2022-06-30
-
-# 全量测试期回测
-python -m src.agent.backtest --train-end 2022-06-30 --test-start 2022-07-01
-```
-
-### 指标标准
-
-| 指标 | 合格 |
+| 文件 | 改动 |
 |---|---|
-| Sharpe Ratio | > 1.0 |
-| 最大回撤 | < 15% |
-| Calmar Ratio | > 0.5 |
-| 胜率 | > 50% |
-| 总收益 | > Buy & Hold |
+| `src/agent/tools.py` | 新增 `get_industry_top_news`, `get_etf_candidates` |
+| `src/agent/single_agent.py` | 重构 `decide_node`，调用新的决策上下文构建 |
+| `src/agent/rule_engine.py` | 新建 Guardrail 规则引擎 |
+| `src/agent/state.py` | 确认/扩展 `TradeDecision` 支持 `selected_indices`, `selected_etf` |
+| `src/signals/raw_scorer.py` | 集成 TCN/IForest/LightGBM（Phase 1，重构） |
+| `config/prompts/trader.md` | 更新 prompt 描述 LLM 决策逻辑 |
 
 ---
 
-## 优势
+## 验证方式
 
-1. **简洁**：完全新建，没有旧代码包袱
-2. **端到端**：原始新闻+ETF → Agent 决策
-3. **行为金融**：模拟人类"跟涨杀跌"心理
-4. **GPU/CPU 自适应**：本地开发，服务器加速
-5. **可解释**：每步 Skill 调用都有记录
-6. **防过拟合**：训练/测试分离 + 周粒度 Walk-Forward
+1. 调用 `build_decision_context("2024-01-01")`，确认 token 量可控（< 5k）
+2. LLM 基于该输入输出的决策格式正确
+3. Guardrail 正确拦截违规决策
+4. 完整 backtest 无 crash

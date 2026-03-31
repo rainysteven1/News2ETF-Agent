@@ -29,3 +29,16 @@ output_weekly_returns = "data/weekly_returns.parquet"
 
 start_date = "2021-01-01"
 end_date = "2024-12-31"
+
+[predict]
+finbert_onnx_dir = "./trainer/checkpoints/finbert/finbert-0323-2219"
+finbert_max_length = 128
+batch_size = 64
+setfit_base_dir = "./trainer/checkpoints/setfit/setfit-0324-0125"
+setfit_max_length = 256
+onnx_cache_dir = "./data/onnx_cache"
+max_cache_weeks = 4
+
+[memos]
+api_key = "YOUR_API_KEY"
+base_url = "https://memos.memtensor.cn/api/openmem/v1"

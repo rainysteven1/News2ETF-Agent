@@ -9,6 +9,7 @@ Usage:
 from __future__ import annotations
 
 import uuid
+from datetime import date, timedelta
 from pathlib import Path
 from typing import Annotated
 
@@ -47,8 +48,8 @@ def _print_table(title: str, rows: list[tuple[str, str]]) -> None:
 
 @app.command()
 def backtest(
-    start_date: Annotated[str, typer.Option("--start-date")],
-    end_date: Annotated[str, typer.Option("--end-date")],
+    start_date: Annotated[str, typer.Option("--start-date")] = (date.today() - timedelta(days=730)).isoformat(),
+    end_date: Annotated[str, typer.Option("--end-date")] = date.today().isoformat(),
     train_end: Annotated[str | None, typer.Option("--train-end")] = None,
     test_start: Annotated[str | None, typer.Option("--test-start")] = None,
     config: Annotated[Path | None, typer.Option("-c", "--config")] = None,

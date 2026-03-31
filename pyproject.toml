@@ -55,10 +55,6 @@ torch = [
     { index = "pytorch-cpu", group = "torch_cpu" },
     { index = "pytorch-gpu", group = "torch_gpu" },
 ]
-torchvision = [
-    { index = "pytorch-cpu", group = "torch_cpu" },
-    { index = "pytorch-gpu", group = "torch_gpu" },
-]
 
 [tool.ruff]
 cache-dir = ".cache/ruff"
