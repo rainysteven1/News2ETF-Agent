@@ -9,6 +9,7 @@ Compatible with weekly backtest frequency.
 
 from __future__ import annotations
 
+import json
 from datetime import datetime
 from pathlib import Path
 
@@ -16,7 +17,80 @@ import numpy as np
 import polars as pl
 import torch
 
-from trainer.config import SignalsDatasetConfig
+from trainer.signals.config import SignalsDatasetConfig
+
+# ─── OHLCV Aggregation ─────────────────────────────────────────────────────────
+
+
+def build_ohlcv_by_industry(
+    ohlcv_path: str | Path,
+    industry_dict_path: str | Path,
+    etf_info_path: str | Path,
+    freq: str = "daily",
+) -> pl.DataFrame:
+    """Aggregate daily OHLCV data by industry from ETF price data.
+
+    Data flow: 大类 → 小类 → indices → ETF info table → ETF codes → OHLCV
+
+    Returns unpivoted DataFrame:
+        date, industry, close, volume, amount, high, low, open
+    """
+    ohlcv = pl.read_parquet(ohlcv_path)
+    etf_info = pl.read_parquet(etf_info_path)
+
+    # Parse trade_dt int → date
+    ohlcv = ohlcv.with_columns(pl.col("trade_dt").cast(str).str.to_date("%Y%m%d").alias("date"))
+
+    # Build index_name → ETF code mapping
+    index_to_codes: dict[str, list[str]] = {}
+    for row in etf_info.iter_rows(named=True):
+        code = row["代码"]
+        index_name = row["跟踪指数名称"]
+        if code and index_name:
+            index_to_codes.setdefault(index_name, []).append(code)
+
+    # Flatten industry_dict: major → sub → indices → ETF codes
+    with open(industry_dict_path, encoding="utf-8") as f:
+        industry_dict = json.load(f)
+
+    industry_etf_codes: dict[str, list[str]] = {}  # industry → codes
+    for major, subs in industry_dict.items():
+        for sub_data in subs.values():
+            for idx_name in sub_data.get("indices", []):
+                if idx_name in index_to_codes:
+                    industry_etf_codes.setdefault(major, []).extend(index_to_codes[idx_name])
+
+    # Deduplicate
+    for k in industry_etf_codes:
+        industry_etf_codes[k] = list(set(industry_etf_codes[k]))
+
+    # Aggregate OHLCV by industry and date
+    rows = []
+    for industry, codes in industry_etf_codes.items():
+        ind_ohlcv = ohlcv.filter(pl.col("Code").is_in(codes))
+        if ind_ohlcv.is_empty():
+            continue
+
+        # Group by date — average across ETFs
+        agg = (
+            ind_ohlcv.group_by("date")
+            .agg(
+                pl.col("close").mean().alias("close"),
+                pl.col("open").mean().alias("open"),
+                pl.col("high").mean().alias("high"),
+                pl.col("low").mean().alias("low"),
+                pl.col("volume").mean().alias("volume"),
+                pl.col("amount").mean().alias("amount"),
+            )
+            .with_columns(pl.lit(industry).alias("industry"))
+        )
+        rows.append(agg)
+
+    if not rows:
+        return pl.DataFrame()
+
+    df = pl.concat(rows).sort(["industry", "date"])
+    return df
 
 
 class WeeklySignalDataset:
@@ -24,16 +98,23 @@ class WeeklySignalDataset:
 
     SENTIMENT_MAP = {"negative": -1.0, "neutral": 0.0, "positive": 1.0}
 
-    def __init__(self, cfg: SignalsDatasetConfig, force: bool = False):
+    def __init__(
+        self,
+        cfg: SignalsDatasetConfig,
+        force: bool = False,
+        ohlcv_cfg=None,  # SignalsOhlcvConfig | None
+    ):
         assert cfg.raw_data_path is not None, "raw_data_path must be set"
         self.raw_path = Path(cfg.raw_data_path)
         self.output_sentiment = Path(cfg.output_sentiment) if cfg.output_sentiment else None
         self.train_end_week = datetime.fromisoformat(cfg.train_end_week)
         self.freq = cfg.freq  # "weekly" or "daily"
         self.cross_industry = cfg.cross_industry
+        self.ohlcv_cfg = ohlcv_cfg
         self.lf: pl.LazyFrame | None = None
         self.sentiment_df: pl.DataFrame | None = None
         self.volume_df: pl.DataFrame | None = None
+        self.ohlcv_df: pl.DataFrame | None = None
 
         # Cache logic: if processed file exists and not forced, load directly
         if self.output_sentiment and self.output_sentiment.exists() and not force:
@@ -42,17 +123,21 @@ class WeeklySignalDataset:
             self._load_raw()
             if self.output_sentiment:
                 self._save_cached(self.output_sentiment)
+                # Reload so sentiment_df matches the saved unpivoted format
+                self._load_cached(self.output_sentiment)
 
     def _load_cached(self, path: Path) -> None:
-        """Load pre-aggregated sentiment parquet (unpivoted: date, industry, sentiment_mean, news_count)."""
+        """Load pre-aggregated parquet (may include OHLCV columns if present)."""
         df = pl.read_parquet(path)
         self.sentiment_df = df.sort(["industry", "date"])
         self.lf = df.lazy()
+        # OHLCV columns are in sentiment_df if they were joined during save
 
     def _save_cached(self, path: Path) -> None:
-        """Save aggregated data as unpivoted parquet for reuse."""
+        """Save aggregated data as unpivoted parquet for reuse (sentiment + volume + OHLCV)."""
         self._ensure_weekly("major_category")
         assert self.sentiment_df is not None and self.volume_df is not None
+
         sent_long = self.sentiment_df.unpivot(index="period", variable_name="industry", value_name="sentiment_mean")
         vol_long = self.volume_df.unpivot(index="period", variable_name="industry", value_name="news_count")
         merged = (
@@ -60,6 +145,71 @@ class WeeklySignalDataset:
             .rename({"period": "date"})
             .sort(["industry", "date"])
         )
+
+        # Join OHLCV data if configured
+        if self.ohlcv_cfg and self.ohlcv_cfg.ohlcv_path:
+            ohlcv = build_ohlcv_by_industry(
+                self.ohlcv_cfg.ohlcv_path,
+                self.ohlcv_cfg.industry_dict_path,
+                self.ohlcv_cfg.etf_info_path,
+            )
+            if not ohlcv.is_empty():
+                self.ohlcv_df = ohlcv
+                # Cast date types to match: merged.date is datetime[μs], ohlcv.date is date
+                ohlcv_sel = ohlcv.select(
+                    [
+                        pl.col("date").cast(pl.Date).alias("date"),
+                        "industry",
+                        "amount",
+                        "high",
+                        "low",
+                        "close",
+                        "open",
+                        "volume",
+                    ]
+                )
+                merged = merged.with_columns(pl.col("date").cast(pl.Date)).join(
+                    ohlcv_sel,
+                    on=["date", "industry"],
+                    how="left",
+                )
+                # Fill OHLCV NaN: forward-fill then backward-fill per industry, finally 0
+                ohlcv_cols = ["amount", "high", "low", "close", "open", "volume"]
+                merged = merged.sort(["industry", "date"])
+                for col in ohlcv_cols:
+                    if col in merged.columns:
+                        merged = merged.with_columns(
+                            pl.col(col).forward_fill().over("industry").fill_null(0).alias(col)
+                        )
+                # Compute daily return: (close - open) / open, safe for zero open
+                if "close" in merged.columns and "open" in merged.columns:
+                    merged = merged.with_columns(
+                        ((pl.col("close") - pl.col("open")) / pl.col("open").clip(lower_bound=1e-9)).alias("return")
+                    )
+
+        # Join sentiment_std and avg_confidence
+        if hasattr(self, "_sentiment_std_df") and self._sentiment_std_df is not None:
+            std_long = self._sentiment_std_df.unpivot(
+                index="period", variable_name="industry", value_name="sentiment_std"
+            )
+            std_long = std_long.with_columns(pl.col("period").cast(pl.Date).alias("date")).drop("period")
+            merged = merged.join(std_long, on=["date", "industry"], how="left")
+            merged = merged.with_columns(pl.col("sentiment_std").fill_null(0))
+        if hasattr(self, "_avg_conf_df") and self._avg_conf_df is not None:
+            conf_long = self._avg_conf_df.unpivot(index="period", variable_name="industry", value_name="avg_confidence")
+            conf_long = conf_long.with_columns(pl.col("period").cast(pl.Date).alias("date")).drop("period")
+            merged = merged.join(conf_long, on=["date", "industry"], how="left")
+            merged = merged.with_columns(pl.col("avg_confidence").fill_null(0))
+
+        # Fill any remaining nulls in core sentiment columns
+        for col in ["sentiment_mean", "news_count"]:
+            if col in merged.columns:
+                merged = merged.with_columns(pl.col(col).fill_null(0))
+
+        # Ensure return column exists (0 if no OHLCV data)
+        if "return" not in merged.columns:
+            merged = merged.with_columns(pl.lit(0.0).alias("return"))
+
         merged.write_parquet(path)
 
     def _load_raw(self) -> None:
@@ -75,34 +225,37 @@ class WeeklySignalDataset:
         self.lf = df.lazy()
 
     def build_weekly(self, industry_col: str = "major_category") -> tuple[pl.DataFrame, pl.DataFrame]:
-        """Aggregate by (period, industry) → weighted sentiment + news count."""
+        """Aggregate by (period, industry) → weighted sentiment + news count + std + avg_conf."""
         if self.freq == "daily":
             period_expr = pl.col("datetime").dt.truncate("1d")
         else:
             period_expr = pl.col("datetime").dt.truncate("1w")
 
-        # Weighted sentiment per (period, industry)
+        # Sentiment per (period, industry): weighted mean + std + avg_confidence
         sent_lf = (
             self.lf.with_columns(period_expr.alias("period"))
             .group_by(["period", industry_col])
             .agg(
                 (pl.col("sentiment_weighted").sum() / (pl.col("confidence_sum").sum() + 1e-9)).alias(
                     "sentiment_weighted"
-                )
+                ),
+                pl.col("sentiment_score").std().alias("sentiment_std"),
+                pl.col("sentiment_confidence").mean().alias("avg_confidence"),
+                pl.len().alias("news_count"),
             )
         )
         self.sentiment_df = (
             sent_lf.collect().pivot(values="sentiment_weighted", index="period", on=industry_col).sort("period")
         )
-
-        # News volume per (period, industry)
-        vol_lf = (
-            self.lf.with_columns(period_expr.alias("period"))
-            .group_by(["period", industry_col])
-            .agg(pl.len().alias("news_count"))
-        )
         self.volume_df = (
-            vol_lf.collect().pivot(values="news_count", index="period", on=industry_col).sort("period").fill_null(0)
+            sent_lf.collect().pivot(values="news_count", index="period", on=industry_col).sort("period").fill_null(0)
+        )
+        # Also keep sentiment_std and avg_confidence per industry per period
+        self._sentiment_std_df = (
+            sent_lf.collect().pivot(values="sentiment_std", index="period", on=industry_col).sort("period")
+        )
+        self._avg_conf_df = (
+            sent_lf.collect().pivot(values="avg_confidence", index="period", on=industry_col).sort("period")
         )
 
         return self.sentiment_df, self.volume_df
@@ -294,12 +447,13 @@ def build_sequences(
     seq_len: int,
     anomaly_threshold: float = 0.03,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Build TCN training data from sentiment time series.
+    """Build TCN training data from sentiment + OHLCV time series.
 
     Returns:
-        X:     (N, seq_len, 1) — sentiment_mean sequences
+        X:     (N, seq_len, 6) — 6-channel sequences:
+               [sentiment_mean, sentiment_std, news_count, avg_confidence,
+                volume_ratio, intraday_vol]
         y_reg: (N, 1) — continuous sentiment delta at next step, clipped to [-1, 1]
-               (not discrete direction, so tanh output is meaningful)
         y_cls: (N, 1) — 1 if |return| > threshold else 0
     """
     X_list, y_reg_list, y_cls_list = [], [], []
@@ -308,19 +462,57 @@ def build_sequences(
         ind_df = sentiment_df.filter(pl.col("industry") == ind).sort("date")
         if len(ind_df) < seq_len + 2:
             continue
+
         vals = ind_df["sentiment_mean"].to_numpy()
+        vals_std = ind_df["sentiment_std"].to_numpy() if "sentiment_std" in ind_df.columns else np.zeros_like(vals)
+        nc = ind_df["news_count"].to_numpy()
+        conf = ind_df["avg_confidence"].to_numpy() if "avg_confidence" in ind_df.columns else np.zeros_like(nc)
         rets = ind_df["return"].to_numpy() if "return" in ind_df.columns else np.zeros_like(vals)
 
-        for i in range(len(vals) - seq_len - 1):
-            X_list.append(vals[i : i + seq_len])
-            # Continuous target: normalized sentiment change (tanh-compatible)
-            sent_delta = vals[i + seq_len] - vals[i + seq_len - 1]
-            target = np.clip(sent_delta / (np.abs(vals[i + seq_len - 1]) + 1e-9), -1, 1)
+        # OHLCV features (fillna → 0 if missing)
+        vol_arr = ind_df["volume"].to_numpy() if "volume" in ind_df.columns else np.zeros_like(vals)
+        high_arr = ind_df["high"].to_numpy() if "high" in ind_df.columns else np.zeros_like(vals)
+        low_arr = ind_df["low"].to_numpy() if "low" in ind_df.columns else np.zeros_like(vals)
+        close_arr = ind_df["close"].to_numpy() if "close" in ind_df.columns else np.zeros_like(vals)
+
+        # Rolling volume MA5
+        vol_ma5 = np.zeros_like(vol_arr)
+        for i in range(1, len(vol_arr)):
+            window = vol_arr[max(0, i - 4) : i + 1]
+            vol_ma5[i] = np.mean(window) if window.size > 0 else 0
+        volume_ratio = np.where(vol_arr > 0, vol_arr / (vol_ma5 + 1e-9), 0.0)
+        volume_ratio = np.clip(volume_ratio, 0.0, 100.0)  # cap extreme ratios
+
+        # Intraday volatility
+        close_safe = np.where(close_arr != 0, close_arr, 1.0)
+        intraday_vol = (high_arr - low_arr) / close_safe
+
+        # Global normalization stats (per channel)
+        n = len(vals)
+        ch0 = vals.astype(np.float32)
+        ch1 = vals_std.astype(np.float32)
+        ch2 = nc.astype(np.float32)
+        ch3 = conf.astype(np.float32)
+        ch4 = volume_ratio.astype(np.float32)
+        ch5 = intraday_vol.astype(np.float32)
+
+        for i in range(n - seq_len - 1):
+            window = np.zeros((seq_len, 6), dtype=np.float32)
+            window[:, 0] = ch0[i : i + seq_len]
+            window[:, 1] = ch1[i : i + seq_len]
+            window[:, 2] = ch2[i : i + seq_len]
+            window[:, 3] = ch3[i : i + seq_len]
+            window[:, 4] = ch4[i : i + seq_len]
+            window[:, 5] = ch5[i : i + seq_len]
+            X_list.append(window)
+
+            sent_delta = ch0[i + seq_len] - ch0[i + seq_len - 1]
+            target = np.clip(sent_delta / (np.abs(ch0[i + seq_len - 1]) + 1e-9), -1, 1)
             y_reg_list.append(target)
             next_ret = rets[i + seq_len]
             y_cls_list.append(1 if abs(next_ret) > anomaly_threshold else 0)
 
-    X = np.array(X_list, dtype=np.float32).reshape(-1, seq_len, 1)
+    X = np.array(X_list, dtype=np.float32)  # (N, seq_len, 6)
     y_reg = np.array(y_reg_list, dtype=np.float32).reshape(-1, 1)
     y_cls = np.array(y_cls_list, dtype=np.float32).reshape(-1, 1)
     return X, y_reg, y_cls
@@ -335,13 +527,16 @@ def build_lgbm_features(
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Build LightGBM feature matrix from TCN outputs + raw signals.
 
-    Features (10 dims):
+    Features (13 dims):
         [delta_sentiment_1w, delta_sentiment_2w, news_count, news_heat,
-         tcn_reg, tcn_cls, tcn_reg_delta,  news_count_std_5d,
-         sentiment_volatility_5d, tcn_reg * news_heat]
+         tcn_reg, tcn_cls, tcn_reg_delta, news_count_std_5d,
+         sentiment_volatility_5d, tcn_reg * news_heat,
+         volume_ratio, intraday_vol, avg_price]
 
     Returns X, y, dates, industries (for time-based split and per-industry IC).
     """
+    has_ohlcv = all(c in sentiment_df.columns for c in ["volume", "high", "low", "close", "open"])
+
     feat_rows, label_rows, date_rows, industry_rows = [], [], [], []
 
     for ind in industries:
@@ -353,20 +548,79 @@ def build_lgbm_features(
         nh = ind_df["news_heat"].to_numpy() if "news_heat" in ind_df.columns else np.zeros_like(nc)
         dates = ind_df["date"].to_list()
 
+        # OHLCV arrays (all same length as vals)
+        if has_ohlcv:
+            vol_arr = ind_df["volume"].to_numpy()
+            high_arr = ind_df["high"].to_numpy()
+            low_arr = ind_df["low"].to_numpy()
+            close_arr = ind_df["close"].to_numpy()
+            open_arr = ind_df["open"].to_numpy()
+        else:
+            vol_arr = high_arr = low_arr = close_arr = open_arr = np.zeros_like(vals)
+
         for i in range(seq_len + 1, len(vals) - 1):
             delta1 = vals[i] - vals[i - 1]
             delta2 = vals[i] - vals[i - 2]
             news_count = nc[i]
             news_heat = nh[i]
 
-            x_t = torch.from_numpy(vals[i - seq_len : i].copy()).reshape(1, seq_len, 1).float().to(device)
+            # Build 6-channel TCN input: (seq_len, 6)
+            ch0 = vals[i - seq_len : i].copy()  # sentiment_mean
+            ch1 = (
+                ind_df["sentiment_std"][i - seq_len : i].to_numpy()
+                if "sentiment_std" in ind_df.columns
+                else np.zeros(seq_len)
+            )
+            ch2 = nc[i - seq_len : i].copy()  # news_count
+            ch3 = (
+                ind_df["avg_confidence"][i - seq_len : i].to_numpy()
+                if "avg_confidence" in ind_df.columns
+                else np.zeros(seq_len)
+            )
+            # volume_ratio and intraday_vol per timestep
+            vol_ma5 = np.array([np.mean(vol_arr[max(0, j - 4) : j + 1]) for j in range(i - seq_len, i)])
+            close_safe = np.where(close_arr[i - seq_len : i] != 0, close_arr[i - seq_len : i], 1.0)
+            ch4 = np.where(vol_arr[i - seq_len : i] > 0, vol_arr[i - seq_len : i] / (vol_ma5 + 1e-9), 0.0)
+            ch5 = (high_arr[i - seq_len : i] - low_arr[i - seq_len : i]) / close_safe
+
+            x_t = (
+                np.stack([ch0, ch1, ch2, ch3, ch4, ch5], axis=1)  # (seq_len, 6)
+                .reshape(1, seq_len, 6)
+                .astype(np.float32)
+            )
+            x_t = torch.from_numpy(x_t).float().to(device)
             with torch.no_grad():
                 reg_out, cls_out = tcn_model(x_t)
             tcn_reg = reg_out.item()
             tcn_cls = cls_out.item()
 
-            # Previous step TCN reg for delta
-            x_prev = torch.from_numpy(vals[i - seq_len - 1 : i - 1].copy()).reshape(1, seq_len, 1).float().to(device)
+            # Previous step TCN reg for delta (6-channel)
+            prev_ch0 = vals[i - seq_len - 1 : i - 1].copy()
+            prev_ch1 = (
+                ind_df["sentiment_std"][i - seq_len - 1 : i - 1].to_numpy()
+                if "sentiment_std" in ind_df.columns
+                else np.zeros(seq_len)
+            )
+            prev_ch2 = nc[i - seq_len - 1 : i - 1].copy()
+            prev_ch3 = (
+                ind_df["avg_confidence"][i - seq_len - 1 : i - 1].to_numpy()
+                if "avg_confidence" in ind_df.columns
+                else np.zeros(seq_len)
+            )
+            prev_vol_ma5 = np.array([np.mean(vol_arr[max(0, j - 4) : j + 1]) for j in range(i - seq_len - 1, i - 1)])
+            prev_close_safe = np.where(close_arr[i - seq_len - 1 : i - 1] != 0, close_arr[i - seq_len - 1 : i - 1], 1.0)
+            prev_ch4 = np.where(
+                vol_arr[i - seq_len - 1 : i - 1] > 0,
+                vol_arr[i - seq_len - 1 : i - 1] / (prev_vol_ma5 + 1e-9),
+                0.0,
+            )
+            prev_ch5 = (high_arr[i - seq_len - 1 : i - 1] - low_arr[i - seq_len - 1 : i - 1]) / prev_close_safe
+            x_prev = (
+                np.stack([prev_ch0, prev_ch1, prev_ch2, prev_ch3, prev_ch4, prev_ch5], axis=1)
+                .reshape(1, seq_len, 6)
+                .astype(np.float32)
+            )
+            x_prev = torch.from_numpy(x_prev).float().to(device)
             with torch.no_grad():
                 reg_prev, _ = tcn_model(x_prev)
             tcn_reg_prev = reg_prev.item()
@@ -378,6 +632,14 @@ def build_lgbm_features(
 
             # Interaction
             tcn_heat_interact = tcn_reg * news_heat
+
+            # OHLCV features for LightGBM
+            if has_ohlcv:
+                vr = np.where(vol_arr[i] > 0, vol_arr[i] / (vol_ma5[-1] + 1e-9), 0.0) if i > 0 else 0.0
+                iv = (high_arr[i] - low_arr[i]) / max(close_arr[i], 1e-9) if close_arr[i] != 0 else 0.0
+                ap = (high_arr[i] + low_arr[i] + close_arr[i] + open_arr[i]) / 4.0
+            else:
+                vr, iv, ap = 0.0, 0.0, 0.0
 
             next_dir = 1 if vals[i + 1] > vals[i] else (-1 if vals[i + 1] < vals[i] else 0)
 
@@ -393,6 +655,9 @@ def build_lgbm_features(
                     news_count_std,
                     sent_vol,
                     tcn_heat_interact,
+                    vr,
+                    iv,
+                    ap,
                 ]
             )
             label_rows.append(next_dir)

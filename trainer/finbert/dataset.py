@@ -10,6 +10,7 @@ Expected parquet columns:
 from __future__ import annotations
 
 from pathlib import Path
+
 import polars as pl
 import torch
 from sklearn.model_selection import train_test_split
@@ -34,14 +35,9 @@ L1_TO_IDX: dict[str, int] = {name: i for i, name in enumerate(L1_CATEGORIES)}
 IDX_TO_L1: dict[int, str] = {i: name for i, name in enumerate(L1_CATEGORIES)}
 
 SENTIMENT_STR_TO_INT: dict[str | int, int] = {
-    "negative": 0,
-    "bearish": 0,
-    0: 0,
-    "neutral": 1,
-    1: 1,
-    "positive": 2,
-    "bullish": 2,
-    2: 2,
+    "利空": 0,
+    "中性": 1,
+    "利好": 2,
 }
 
 SENTIMENT_LABELS: list[str] = ["negative", "neutral", "positive"]
@@ -52,11 +48,11 @@ SENTIMENT_LABELS: list[str] = ["negative", "neutral", "positive"]
 
 def preprocess_split(
     raw_path: Path,
-    data_dir: Path,
     val_ratio: float = 0.15,
     seed: int = 42,
 ) -> None:
     """Split raw labeled data into train/val parquet files using stratified sampling."""
+    data_dir = raw_path.parent
     train_path = data_dir / "train.parquet"
     val_path = data_dir / "val.parquet"
 

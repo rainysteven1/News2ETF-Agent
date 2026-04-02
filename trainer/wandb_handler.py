@@ -4,132 +4,139 @@ Loguru handles console output (logger.info/success).
 WandbHandler pushes metrics to wandb dashboard.
 Both run simultaneously and independently.
 
-Usage:
-    wb = WandbHandler(project="news2etf", name="run-001", tags=["signals"])
-    wb.log({"loss": 0.5}, step=1)
-    wb.log_epoch("pretrain", epoch=1, loss=0.3, extras={"reg_loss": 0.1})
-    wb.finish()
+Registry-based multi-instance pattern:
+
+  # FinBERT — single instance
+  WandbRegistry.init("finbert")
+  wb = WandbRegistry.get("finbert")
+
+  # SetFit — one per major, registered upfront
+  WandbRegistry.init("setfit_major1", tags=["setfit", "major1"])
+  WandbRegistry.init("setfit_major2", tags=["setfit", "major2"])
+  wb1 = WandbRegistry.get("setfit_major1")
+  wb2 = WandbRegistry.get("setfit_major2")
+
+  # No-args convenience: uses key="default"
+  WandbRegistry.init()
+  wb = WandbRegistry.get()
 """
 
 from __future__ import annotations
 
 import os
+import random
+import string
 from pathlib import Path
 from typing import Any
 
-import wandb
 from loguru import logger
 
+import wandb
+from trainer.config import get_config
 
-def _build_lstm_config_dict(cfg: Any) -> dict[str, Any]:
-    """Build wandb config dict from TrainerConfig (LSTM pipeline)."""
-    return {
-        "lstm_hidden_size": cfg.tcn.hidden_size,
-        "lstm_num_layers": cfg.tcn.num_layers,
-        "lstm_dropout": cfg.tcn.dropout,
-        "seq_len": cfg.tcn.sequence_length,
-        "epochs_pretrain": cfg.training.epochs_pretrain,
-        "epochs_finetune": cfg.training.epochs_finetune,
-        "batch_size": cfg.training.batch_size,
-        "lr": cfg.training.lr,
-        "num_heads": cfg.training.num_heads,
-        "anomaly_threshold": cfg.training.anomaly_threshold,
-        "lgbm_num_leaves": cfg.lightgbm.num_leaves,
-        "lgbm_lr": cfg.lightgbm.learning_rate,
-        "lgbm_n_estimators": cfg.lightgbm.n_estimators,
-    }
+
+def _generate_wandb_run_name(prefix: str) -> str:
+    """Generate a unique W&B run name with a 4-char random suffix."""
+    suffix = "".join(random.choices(string.ascii_lowercase + string.digits, k=4))
+    return f"{prefix}_{suffix}"
+
+
+# ── Registry ──────────────────────────────────────────────────────────────────
+
+
+class WandbRegistry:
+    """Registry for multiple WandbHandler instances."""
+
+    _handlers: dict[str, WandbHandler] = {}
+
+    @classmethod
+    def init(cls, key: str = "default", run_name: str | None = None, tags: list[str] | None = None) -> None:
+        """Register (or replace) a named WandbHandler in the registry.
+
+        Args:
+            key: Unique identifier for this handler (e.g. "finbert", "setfit_technology").
+                 Subsequent calls with the same key replace the existing handler.
+            tags: Override config.toml tags for this handler only.
+        """
+        handler = WandbHandler(tags=tags)
+        cls._handlers[key] = handler
+
+    @classmethod
+    def get(cls, key: str = "default") -> WandbHandler:
+        """Return a named handler from the registry."""
+        assert key in cls._handlers, f"WandbHandler '{key}' not found. Call WandbRegistry.init('{key}', ...) first."
+        return cls._handlers[key]
+
+    @classmethod
+    def finish_all(cls) -> None:
+        """Finish all registered handlers."""
+        for handler in cls._handlers.values():
+            handler.finish()
+
+
+# ── Handler ───────────────────────────────────────────────────────────────────
 
 
 class WandbHandler:
-    """Handles wandb metrics logging. Works alongside loguru (console output is separate)."""
+    """W&B metrics handler. Settings come from config.toml, optionally overridden per-instance."""
 
     def __init__(
         self,
-        project: str = "news2etf",
-        name: str | None = None,
-        config: Any = None,
-        config_dict: dict[str, Any] | None = None,
+        run_name: str | None = None,
         tags: list[str] | None = None,
-        mode: str = "online",
-        entity: str | None = None,
-    ):
-        self.enabled = mode != "disabled" and (mode != "online" or bool(os.environ.get("WANDB_API_KEY")))
+    ) -> None:
+        self._cfg = get_config().wandb
         self._run = None
         self._run_id: str | None = None
-        self._tags = tags or []
 
-        if config is not None:
-            cfg_dict = _build_lstm_config_dict(config)
-        else:
-            cfg_dict = config_dict or {}
+        # Override config with explicitly passed values
+        self._tags = tags if tags is not None else self._cfg.tags
 
-        if self.enabled:
-            self._run = wandb.init(
-                project=project,
-                entity=entity,
-                name=name,
-                config=cfg_dict,
-                tags=self._tags,
-                mode=mode,  # type: ignore
-            )
-            self._run_id = self._run.id
-            logger.info(f"[Wandb] Started run: {self._run.url} (tags={self._tags}, mode={mode})")
-
-    def log(self, metrics: dict[str, Any], step: int | None = None) -> None:
-        """Log metrics to wandb dashboard."""
-        if not self.enabled:
-            return
-        wandb.log(metrics, step=step)
-
-    def log_epoch(
-        self,
-        stage: str,
-        epoch: int,
-        loss: float,
-        extras: dict[str, Any] | None = None,
-    ) -> None:
-        """Log per-epoch metrics with stage and epoch context.
-
-        Logs to wandb with step=epoch so each epoch is a separate data point.
-        """
-        if not self.enabled:
-            return
-        d: dict[str, Any] = {
-            "stage": stage,
-            "epoch": epoch,
-            "loss": loss,
-        }
-        if extras:
-            d.update(extras)
-        wandb.log(d, step=epoch)
-
-    def log_summary(self, metrics: dict[str, Any]) -> None:
-        """Write final scalars to the run summary."""
-        if not self.enabled or not self._run:
-            return
-        for key, value in metrics.items():
-            self._run.summary[key] = value
-
-    def finish(self) -> None:
-        """Finish the wandb run."""
-        if self.enabled and self._run is not None:
-            self._run.finish()
-            logger.info("[Wandb] Run finished.")
+        self._login()
+        self._init_run(run_name or _generate_wandb_run_name("trainer"))
 
     @property
-    def run_id(self) -> str | None:
+    def id(self) -> str | None:
         """W&B run ID."""
         return self._run_id
 
-    def upload_artifact(
+    def _login(self):
+        """Login to W&B using API key from environment variable."""
+        api_key = os.getenv("WANDB_API_KEY")
+        if not api_key and self._cfg.mode == "online":
+            raise ValueError("W&B API key not found in environment variable 'WANDB_API_KEY'")
+        wandb.login(key=api_key)
+
+    def _init_run(self, run_name: str):
+        self._run = wandb.init(
+            project=self._cfg.project,
+            entity=self._cfg.entity,
+            name=run_name,
+            tags=self._tags,
+            mode=self._cfg.mode,
+        )
+        self._run_id = self._run.id if self._run is not None else None
+
+    def log_metrics(self, metrics: dict[str, Any], step: int | None = None) -> None:
+        """Log metrics to wandb dashboard."""
+        wandb.log(metrics, step=step)
+
+    def log_summary(self, metrics: dict[str, Any]) -> None:
+        """Log summary metrics to W&B run summary."""
+        if self._run is not None:
+            for key, value in metrics.items():
+                self._run.summary[key] = value
+
+    def log_artifact(
         self,
         artifact_path: str | Path,
         name: str,
         artifact_type: str = "model",
+        metadata: dict[str, Any] | None = None,
         aliases: list[str] | None = None,
-    ) -> None:
-        """Upload a local file or directory as a W&B artifact."""
-        if not self.enabled:
+    ):
+        """Upload a file as a W&B artifact."""
+        if not self._run:
             logger.info(f"[Wandb] Artifact upload skipped (disabled): {name}")
             return
 
@@ -137,12 +144,18 @@ class WandbHandler:
         if not artifact_path.exists():
             logger.warning(f"[Wandb] Artifact path does not exist: {artifact_path}")
             return
-        artifact = wandb.Artifact(name=name, type=artifact_type)
+
+        artifact = wandb.Artifact(name=name, type=artifact_type, metadata=metadata or {})
         if artifact_path.is_dir():
             artifact.add_dir(str(artifact_path))
         else:
             artifact.add_file(str(artifact_path), name=artifact_path.name)
 
+        self._run.log_artifact(artifact, aliases=aliases or [])
+        logger.info(f"[Wandb] Artifact uploaded: {name} ({artifact_type})")
+
+    def finish(self) -> None:
+        """Finish the wandb run."""
         if self._run is not None:
-            self._run.log_artifact(artifact, aliases=aliases or [])
-            logger.info(f"[Wandb] Artifact uploaded: {name} ({artifact_type})")
+            self._run.finish()
+            logger.info("[Wandb] Run finished.")

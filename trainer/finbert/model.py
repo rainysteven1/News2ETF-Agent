@@ -12,10 +12,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from loguru import logger
-
 import torch
 import torch.nn as nn
+from loguru import logger
 from transformers.configuration_utils import PretrainedConfig
 from transformers.models.bert.modeling_bert import BertModel, BertPreTrainedModel
 
@@ -29,7 +28,11 @@ def mean_pooling(hidden_states: torch.Tensor, attention_mask: torch.Tensor) -> t
 
 
 class FinBERTClassifierConfig(PretrainedConfig):
-    """Configuration for simplified FinBERT classifier."""
+    """Configuration for simplified FinBERT classifier.
+
+    Inherits all BERT attributes from PretrainedConfig so that BertModel
+    (which accesses config.position_embedding_type etc.) initializes correctly.
+    """
 
     model_type = "finbert_classifier"
 
@@ -40,9 +43,28 @@ class FinBERTClassifierConfig(PretrainedConfig):
         classifier_dropout: float = 0.1,
         alpha: float = 0.1,
         gamma: float = 0.1,
+        # BERT attributes (populated by from_pretrained via kwargs)
+        hidden_size: int = 768,
+        num_hidden_layers: int = 12,
+        num_attention_heads: int = 12,
+        intermediate_size: int = 3072,
+        hidden_dropout_prob: float = 0.1,
+        attention_probs_dropout_prob: float = 0.1,
+        max_position_embeddings: int = 512,
+        position_embedding_type: str = "absolute",
         **kwargs,
     ):
-        super().__init__(**kwargs)
+        super().__init__(
+            hidden_size=hidden_size,
+            num_hidden_layers=num_hidden_layers,
+            num_attention_heads=num_attention_heads,
+            intermediate_size=intermediate_size,
+            hidden_dropout_prob=hidden_dropout_prob,
+            attention_probs_dropout_prob=attention_probs_dropout_prob,
+            max_position_embeddings=max_position_embeddings,
+            position_embedding_type=position_embedding_type,
+            **kwargs,
+        )
         self.num_level1 = num_level1
         self.num_sentiment = num_sentiment
         self.classifier_dropout = classifier_dropout

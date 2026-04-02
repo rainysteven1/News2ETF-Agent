@@ -27,10 +27,9 @@ from sklearn.metrics import r2_score
 from torch.optim.adam import Adam
 from torch.utils.data import DataLoader, TensorDataset
 
-from trainer.config import TrainerConfig, load_config
-from trainer.signals.dataset import build_lgbm_features, build_sequences, WeeklySignalDataset
+from trainer.signals.config import SignalsConfig, load_signals_config
+from trainer.signals.dataset import WeeklySignalDataset, build_lgbm_features, build_sequences
 from trainer.signals.models import TCN
-from trainer.wandb_handler import WandbHandler
 
 # ─── Model Training ─────────────────────────────────────────────────────────────
 
@@ -39,7 +38,7 @@ def train_tcn_pretrain(
     X: np.ndarray,
     y_reg: np.ndarray,
     y_cls: np.ndarray,
-    cfg: TrainerConfig,
+    cfg: SignalsConfig,
     wb: WandbHandler,
     device: torch.device,
 ) -> TCN:
@@ -47,7 +46,7 @@ def train_tcn_pretrain(
     tc = cfg.training
     sc = cfg.tcn
     model = TCN(
-        input_size=1,
+        input_size=6,
         hidden_size=sc.hidden_size,
         num_layers=sc.num_layers,
         dropout=sc.dropout,
@@ -91,7 +90,7 @@ def finetune_per_industry(
     sentiment_df: pl.DataFrame,
     industries: list[str],
     base_model: TCN,
-    cfg: TrainerConfig,
+    cfg: SignalsConfig,
     wb: WandbHandler,
     device: torch.device,
 ) -> TCN:
@@ -110,6 +109,8 @@ def finetune_per_industry(
     reg_criterion = nn.MSELoss()
     cls_criterion = nn.BCELoss()
 
+    has_ohlcv = all(c in sentiment_df.columns for c in ["volume", "high", "low", "close", "open"])
+
     for ind in industries:
         ind_df = sentiment_df.filter(pl.col("industry") == ind).sort("date")
         if len(ind_df) < seq_len + 2:
@@ -117,9 +118,37 @@ def finetune_per_industry(
         vals = ind_df["sentiment_mean"].to_numpy()
         rets = ind_df["return"].to_numpy() if "return" in ind_df.columns else np.zeros_like(vals)
 
+        if has_ohlcv:
+            vol_arr = ind_df["volume"].to_numpy()
+            high_arr = ind_df["high"].to_numpy()
+            low_arr = ind_df["low"].to_numpy()
+            close_arr = ind_df["close"].to_numpy()
+            open_arr = ind_df["open"].to_numpy()
+        else:
+            vol_arr = high_arr = low_arr = close_arr = open_arr = np.zeros_like(vals)
+
         X_ind, y_reg_ind, y_cls_ind = [], [], []
         for i in range(len(vals) - seq_len - 1):
-            X_ind.append(vals[i : i + seq_len])
+            # 6-channel window: sentiment_mean, sentiment_std, news_count,
+            # avg_confidence, volume_ratio, intraday_vol
+            ch0 = vals[i : i + seq_len]
+            ch1 = (
+                ind_df["sentiment_std"][i : i + seq_len].to_numpy()
+                if "sentiment_std" in ind_df.columns
+                else np.zeros(seq_len)
+            )
+            ch2 = ind_df["news_count"][i : i + seq_len].to_numpy()
+            ch3 = (
+                ind_df["avg_confidence"][i : i + seq_len].to_numpy()
+                if "avg_confidence" in ind_df.columns
+                else np.zeros(seq_len)
+            )
+            vol_ma5 = np.array([np.mean(vol_arr[max(0, j - 4) : j + 1]) for j in range(i, i + seq_len)])
+            close_safe = np.where(close_arr[i : i + seq_len] != 0, close_arr[i : i + seq_len], 1.0)
+            ch4 = np.where(vol_arr[i : i + seq_len] > 0, vol_arr[i : i + seq_len] / (vol_ma5 + 1e-9), 0.0)
+            ch5 = (high_arr[i : i + seq_len] - low_arr[i : i + seq_len]) / close_safe
+
+            X_ind.append(np.stack([ch0, ch1, ch2, ch3, ch4, ch5], axis=1))  # (seq_len, 6)
             # Continuous target (same as pretrain)
             target = np.clip(
                 (vals[i + seq_len] - vals[i + seq_len - 1]) / (np.abs(vals[i + seq_len - 1]) + 1e-9),
@@ -133,7 +162,7 @@ def finetune_per_industry(
         if len(X_ind) < 2:
             continue
 
-        X_t = torch.FloatTensor(np.array(X_ind, dtype=np.float32)).reshape(-1, seq_len, 1).to(device)
+        X_t = torch.FloatTensor(np.array(X_ind, dtype=np.float32)).reshape(-1, seq_len, 6).to(device)
         y_reg_t = torch.FloatTensor(np.array(y_reg_ind, dtype=np.float32)).reshape(-1, 1).to(device)
         y_cls_t = torch.FloatTensor(np.array(y_cls_ind, dtype=np.float32)).reshape(-1, 1).to(device)
 
@@ -283,8 +312,7 @@ def analyze_residuals(
         wb.log_summary(result)
 
     logger.info(
-        f"  [{stage}] Residuals — skew={skew:.3f} kurt={kurt:.3f} "
-        f"shapiro_p={shapiro_p:.4f} (p<0.05→non-normal)"
+        f"  [{stage}] Residuals — skew={skew:.3f} kurt={kurt:.3f} shapiro_p={shapiro_p:.4f} (p<0.05→non-normal)"
     )
     return result
 
@@ -294,25 +322,26 @@ def analyze_residuals(
 
 def run_training(force: bool = False) -> dict[str, str]:
     """Full pipeline: pretrain → finetune → LightGBM stacking."""
-    cfg = load_config()
-    wcfg = cfg.wandb
+    signals_cfg = load_signals_config()
+    wandb_cfg = load_wandb_config().wandb
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    wb = WandbHandler(
-        project=wcfg.project,
-        entity=cfg.wandb.entity,
-        name=f"signals-{datetime.now():%m%d-%H%M}",
-        config=cfg,
+    init_wandb_handler(
+        "signals",
         tags=["signals", "TCN", "LightGBM", "IsolationForest"],
-        mode=cfg.wandb.mode,
+        name=f"signals-{datetime.now():%m%d-%H%M}",
+        mode=wandb_cfg.mode,
+        project=wandb_cfg.project,
+        entity=wandb_cfg.entity,
     )
+    wb = get_wandb_handler("signals")
 
     logger.info(f"[Train] Device: {device}")
-    logger.info(f"[Train] Config: seq_len={cfg.tcn.sequence_length}, hidden={cfg.tcn.hidden_size}")
+    logger.info(f"[Train] Config: seq_len={signals_cfg.tcn.sequence_length}, hidden={signals_cfg.tcn.hidden_size}")
 
     # ── Load / build sentiment data via WeeklySignalDataset ───────────────────
     #   If output_sentiment parquet exists → load directly; otherwise process raw.
-    ds = WeeklySignalDataset(cfg.dataset, force=force)
+    ds = WeeklySignalDataset(signals_cfg.dataset, force=force, ohlcv_cfg=signals_cfg.ohlcv)
     sentiment_df = ds.sentiment_df
     assert sentiment_df is not None, "sentiment_df is None after dataset init"
     industries = sentiment_df["industry"].unique().to_list()
@@ -323,19 +352,19 @@ def run_training(force: bool = False) -> dict[str, str]:
 
     # ── Step A: Pretrain on ALL industries mixed ───────────────────────────────
     logger.info("\n[Step A] Pretrain TCN on mixed industries...")
-    seq_len = cfg.tcn.sequence_length
-    tc = cfg.training
+    seq_len = signals_cfg.tcn.sequence_length
+    tc = signals_cfg.training
     X_all, y_reg_all, y_cls_all = build_sequences(sentiment_df, industries, seq_len, tc.anomaly_threshold)
     logger.info(f"  Mixed data: X={X_all.shape}, y_reg={y_reg_all.shape}, y_cls={y_cls_all.shape}")
 
-    tcn_model = train_tcn_pretrain(X_all, y_reg_all, y_cls_all, cfg, wb, device)
+    tcn_model = train_tcn_pretrain(X_all, y_reg_all, y_cls_all, signals_cfg, wb, device)
 
     # ── Step B: Finetune per industry ─────────────────────────────────────────
     logger.info("\n[Step B] Finetune TCN per industry...")
-    tcn_model = finetune_per_industry(sentiment_df, industries, tcn_model, cfg, wb, device)
+    tcn_model = finetune_per_industry(sentiment_df, industries, tcn_model, signals_cfg, wb, device)
 
     # ── Save TCN ──────────────────────────────────────────────────────────────
-    checkpoint_dir = cfg.training.output_checkpoint / f"signals-{datetime.now():%m%d-%H%M}"
+    checkpoint_dir = signals_cfg.training.output_checkpoint / f"signals-{datetime.now():%m%d-%H%M}"
     checkpoint_dir.mkdir(exist_ok=True, parents=True)
     tcn_path = checkpoint_dir / "tcn.pt"
     torch.save(tcn_model.state_dict(), tcn_path)
@@ -343,12 +372,10 @@ def run_training(force: bool = False) -> dict[str, str]:
 
     # ── Step C: LightGBM stacking ───────────────────────────────────────────────
     logger.info("\n[Step C] Build stacking features + train LightGBM...")
-    X_lgbm, y_lgbm, dates, industry_lgbm = build_lgbm_features(
-        sentiment_df, industries, seq_len, tcn_model, device
-    )
+    X_lgbm, y_lgbm, dates, industry_lgbm = build_lgbm_features(sentiment_df, industries, seq_len, tcn_model, device)
     logger.info(f"  LGBM data: X={X_lgbm.shape}, y={y_lgbm.shape}")
 
-    lgbm_model = train_lgbm_stacking(X_lgbm, y_lgbm, dates, cfg, wb)
+    lgbm_model = train_lgbm_stacking(X_lgbm, y_lgbm, dates, signals_cfg, wb)
 
     # ── Post-step C: Industry IC + Residual analysis ─────────────────────────────
     # Time-based split (last 20%)
@@ -375,13 +402,25 @@ def run_training(force: bool = False) -> dict[str, str]:
         ind_df = sentiment_df.filter(pl.col("industry") == ind).sort("date")
         nc = ind_df["news_count"].to_numpy()
         nh = ind_df["news_heat"].to_numpy() if "news_heat" in ind_df.columns else np.zeros_like(nc)
+        amt = ind_df["amount"].to_numpy() if "amount" in ind_df.columns else np.zeros_like(nc)
+
+        # Rolling stats for amount (5-day mean + std)
+        roll_mean = np.array([np.mean(amt[max(0, i - 4) : i + 1]) for i in range(len(amt))])
+        roll_std = np.array([np.std(amt[max(0, i - 4) : i + 1]) + 1e-9 for i in range(len(amt))])
+
         for i in range(len(nc) - seq_len * 2):
-            iforest_X.append(list(nc[i : i + seq_len]) + list(nh[i : i + seq_len]))
+            iforest_X.append(
+                list(nc[i : i + seq_len])
+                + list(nh[i : i + seq_len])
+                + list(amt[i : i + seq_len])
+                + list(roll_mean[i : i + seq_len])
+                + list(roll_std[i : i + seq_len])
+            )
 
     iforest_X = np.array(iforest_X, dtype=np.float32)
     iforest = IsolationForest(
-        contamination=cfg.isolation_forest.contamination,
-        n_estimators=cfg.isolation_forest.n_estimators,
+        contamination=signals_cfg.isolation_forest.contamination,
+        n_estimators=signals_cfg.isolation_forest.n_estimators,
         random_state=42,
     )
     iforest.fit(iforest_X)
@@ -431,7 +470,7 @@ def _export_all_onnx(
             tcn_model_cpu,
             tcn_onnx_path,
             seq_len=seq_len,
-            input_size=1,
+            input_size=6,
         )
         tcn_model.to(device)  # move back to original device
         results["tcn_onnx"] = tcn_onnx_path
@@ -467,8 +506,7 @@ def _export_all_onnx(
         results["iforest_onnx"] = iforest_onnx_path
         logger.info(f"  [ONNX] IsolationForest → {iforest_onnx_path}")
     except Exception as exc:
-        logger.warning(f"  [ONNX] IsolationForest export failed ({type(exc).__name__}): {exc}. "
-                      "Falling back to pickle.")
+        logger.warning(f"  [ONNX] IsolationForest export failed ({type(exc).__name__}): {exc}. Falling back to pickle.")
         results["iforest_onnx"] = None
 
     return results

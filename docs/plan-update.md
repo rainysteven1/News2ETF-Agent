@@ -1,8 +1,15 @@
-# Plan: LLM 驱动的行业轮动 + ETF 智能选择
+# Plan Update: 三阶段训练架构 + 双模式决策系统
 
 ## Context
 
-用户确认：**LLM 做真正的行业判断，不是规则引擎**。规则只做 Guardrail。
+原 plan.md 存在以下核心问题：
+
+1. **数据划分不完整** - 只有 train/test，没有为 Agent 单独设立"决策学习期"
+2. **Agent 特征不足** - 只有信号输出，缺少市场状态特征和历史回溯特征
+3. **Agent 训练方法缺失** - 只说"重构 decide_node"，没说如何让 LLM 学习决策逻辑
+4. **冷启动问题未处理** - Agent 首周无历史持仓/收益反馈
+5. **交易成本未嵌入** - guardrail 提了 0.1% 但未在特征层面体现
+6. **决策频率模糊** - 隐含每日决策，但 A 股周频调仓更合理
 
 ---
 
@@ -37,7 +44,7 @@
 
 ---
 
-## 三阶段数据划分
+## 三阶段数据划分（核心改动）
 
 ```
 时间线：2023-01 ───────────────────────────────────── 2026-03
@@ -73,6 +80,7 @@ for each Monday in Phase 2:
     iforest_heat = iforest_model.predict(meta_sentiment)       # 8 维热度异常
 
     # 7. 构成本周 Agent 输入（TCN 日频序列 + 新闻摘要）
+    #    TCN 序列: shape (5, 8) = 过去 5 个交易日的 8 维动量
     agent_input = build_agent_features(tcn_daily_sequence, lgbm_signal, ...)
 
     # 8. Agent 决策（每周一执行）
@@ -104,10 +112,10 @@ for each Monday in Phase 2:
 
 | 通道 | 字段 | 说明 |
 |------|------|------|
-| 1 | `sentiment_ema` | EMA 平滑后的情感"存量"，α=0.2，防止信号断崖 |
+| 1 | `sentiment_ema` | EMA 平滑后的情感"存量"，$\alpha=0.2$，防止信号断崖 |
 | 2 | `sentiment_acceleration` | 情感变化的变化率（爆发点检测） |
 | 3 | `sentiment_std` | 1 小时内情感标准差（共识 vs 多空博弈） |
-| 4 | `log_news_count` | log(news_count + 1)，消除长尾，捕捉爆发 |
+| 4 | `log_news_count` | $\log(\text{news\_count} + 1)$，消除长尾，捕捉爆发 |
 | 5 | `event_type_embedding` | 事件类型 One-hot：政策/业绩/技术/其他 |
 | 6 | `sentiment_vs_price_residual` | 情感 Z-score - 价格 Z-score，背离度检测 |
 
@@ -122,6 +130,22 @@ S_now = 0.2 * S_new + 0.8 * S_yesterday
 标签 = clip((meta_sentiment[t+5] - meta_sentiment[t]) / (|meta_sentiment[t]| + 1e-9), -1, 1)
 ```
 
+**TCN 架构：扇入式 47→8 映射（Critical）**：
+```
+输入：  (batch, 47, time_steps, 6)   # 47 个细分行业 × 6 通道
+        ↓
+中间层：TCN stack（kernel_size=3, dilation=[1,2,4,8]）
+        ↓
+展平层：Flatten(47 * hidden) → Linear(47 * hidden, 128)
+        ↓
+输出层：Linear(128, 8)              # 8 个元板块动量
+```
+
+**为什么用扇入（Fan-in）结构**：
+- 强迫模型在预测"科技成长"时，必须同时看到"半导体材料+光刻机+消费电子+..."的联合信号
+- 比先聚类再进 TCN 更有利于保留原始信号的微小差异
+- 跨行业关联被显式学习，而不是被固定权重叠加掩盖
+
 **Sentiment-Price Divergence**（博弈特征）：
 ```
 sent_p_divergence = sentiment_zscore_5d - return_zscore_5d
@@ -129,83 +153,11 @@ sent_p_divergence = sentiment_zscore_5d - return_zscore_5d
 < 0: 价格已兑现情绪 → 谨防利好出尽
 ```
 
-**防止信息渗透（Critical）**：
-- `sentiment_ma_6h` 在计算 T 时刻时，只包含 T-1 分钟之前的新闻
+**⚠️ 防止信息渗透（Critical）**：
+- `sentiment_ma_6h` 在计算 $T$ 时刻时，只包含 $T-1$ 分钟之前的新闻
 - **绝不**在特征里包含"当日收盘价"（当日收盘价只给 Agent 观察用，不是模型特征）
 - **隔夜新闻标记**：`is_overnight_news` — 20:00-08:00 的新闻归到次日开盘前处理
 - 每日 `build_agent_features` 在 **8:30** 执行，汇总隔夜情绪，作为开盘决策依据
-
----
-
-## 核心设计决策
-
-### 1. 为什么"分而复合"比"直接分类"更强？
-
-**本质：语义解耦 + 策略重组**
-
-**第一步（8 → 47）：感知提取**
-- BERT 模型在区分"半导体"和"软件"时需要非常具体的上下文特征
-- 只分大类会丢失这些微小的语义差异
-- 47 个细分让感知层尽可能保留原始信息
-
-**第二步（47 → 8）：逻辑路由**
-- 例子：有 3 条"光刻机"新闻（半导体）+ 2 条"大模型"新闻（AI）→ 各自信号都弱
-- 在"科技成长"元板块汇聚 → 5 条强信号，噪声被自然平滑
-- 类似经验丰富的基金经理：观察 47 个细分行业的风吹草动，得出"下周看好科技成长"的结论
-
-### 2. TCN 设计核心修正
-
-**输入**：47 维细分行业情感时序 `(batch, seq_len=5, 47)`
-**输出**：8 维元板块动量分数 `(batch, 8)`
-
-```
-TCN 的角色：学习 47 个细分之间的跨行业传导模式
-
-例如：油价上涨 → 化工(周期资源) → 物流(交通运输) → 消费品(大消费)
-TCN 需要学会捕捉这类跨行业传导链。
-```
-
-**为什么不用聚合后的 8 维输入？**
-- 聚合会丢失细分间的协方差信息
-- TCN 的价值正是从高维噪声中提取共享因子
-- 直接用 8 维输入会让 TCN 退化为简单的时间序列模型，失去"跨行业学习"能力
-
-### 3. 情感聚合：加权投票制（非简单平均）
-
-**公式**：
-```
-元板块情感(t) = Σ(细分情感_i(t) × weight_i) / Σ weight_i
-```
-
-**权重设计原则**：
-- 核心驱动力权重高（0.3-0.4）
-- 辅助/边缘分类权重低（0.1-0.2）
-- 例：半导体(0.4) + AI(0.4) + 软件(0.2) → 科技成长
-
-```
-元板块 ← 细分                     推荐权重   理由
-科技成长 ← 半导体/AI               0.35     核心驱动力
-科技成长 ← 软件/信创/云计算         0.25     辅助特征
-科技成长 ← 电子/通信设备            0.20     边缘平滑
-高端制造 ← 新能源/军工              0.35     核心驱动力
-高端制造 ← 机器人/航空航天          0.35     核心驱动力
-高端制造 ← 机械设备                0.30     辅助特征
-大消费 ← 食品饮料/医药健康           0.30     顺周期核心
-大消费 ← 旅游/文娱                  0.25     消费辅助
-大消费 ← 家电/零售                  0.25     消费辅助
-红利/中特估 ← 央企/国企/银行         0.35     核心
-红利/中特估 ← 能源/基建              0.35     核心
-红利/中特估 ← ESG                   0.30     辅助
-金融地产 ← 非银金融/地产             0.45     核心
-金融地产 ← 建筑                     0.35     政策博弈
-周期资源 ← 有色金属/化工             0.35     大宗核心
-周期资源 ← 钢铁/煤炭                0.35     大宗核心
-周期资源 ← 石油石化                 0.30     辅助
-智能网联 ← 新能车/汽车零部件         0.40     硬件核心
-智能网联 ← 物联网                  0.35     软件核心
-智能网联 ← 电子/通信设备            0.25     边缘平滑
-区域经济 ← 长三角/大湾区/成渝        各0.33   平均
-```
 
 ---
 
@@ -220,6 +172,7 @@ tcn_sequence[5, 8]: 过去 5 个交易日 × 8 元板块动量分数
   科技成长: [0.20, 0.28, 0.35, 0.42, 0.51]  ← 持续上行
   金融周期: [0.10, 0.05, -0.10, -0.15, -0.20] ← 持续下行
 ```
+让 LLM 看到**趋势线**，而不是单点值。
 
 **B. 本周新闻摘要（每周聚合）**
 ```
@@ -307,9 +260,16 @@ SYSTEM_PROMPT = """
 ```
 Step 1: Phase 2 每周记录决策日志
     decision_log = [
-        {monday_date, agent_input, decision, weekly_return, guardrail_events},
-        ...
-    ]
+        {monday_date, agent_input, decision, weekly_return, guardrail_events,
+         tcn_prediction_error: {  # 新增：让 Agent 学会"质疑模型"
+           meta_sector: "科技成长",
+           tcn_predicted: 0.85,    # TCN 给出的动量分数
+           actual_return: -0.04,   # 实际收益
+           divergence: 0.89,       # |predicted - actual|
+           root_cause_guess: "利好出尽 / 黑天鹅 / 关联板块拖累 / ..."  # LLM 复盘时自己填
+         },
+         ...
+        ]
 
 Step 2: 标注"决策质量"（每周评估一次）
     for each week in Phase 2:
@@ -332,6 +292,17 @@ Step 3: 提取 good/bad patterns（用于更新 Few-shot）
 
 Step 4: 将 patterns 注入 Prompt（每 4 周更新一次）
 ```
+
+### 决策逻辑检查清单（让 LLM 自我审查）
+
+每次决策前，LLM 需要检查：
+
+1. **预期差识别**：TCN 情感极好（> 0.6）但价格已连涨 3 天 → "情绪已充分定价，谨防利好出尽"
+2. **关联性回避**：已持有某板块，当另一个同 correlation_cluster 板块出现信号时 → "风险重叠，谨慎加仓"
+3. **波动率自适应**：当前 vol_percentile > 0.8 → "市场高波动，降低 Beta 暴露"
+4. **趋势延续性**：price_momentum_4w 持续上行 → "趋势强劲，可适度追涨"
+5. **止损检查**：recent_drawdown_3d < -5% → "超跌，观察是否见底"
+6. **模型质疑**（Phase 2 复盘）：本周 TCN_Prediction_Error 较大的板块 → "这个板块上周信号失效，是因为突发黑天鹅，还是模型过热？本周围绕该板块的决策是否需要更保守？"
 
 ---
 
@@ -372,127 +343,45 @@ Step 4: 将 patterns 注入 Prompt（每 4 周更新一次）
 
 **注意**：日 Guardrail 只做"紧急退出"，不参与正常仓位调整。
 
----
+### Guardrail 优先级覆盖（Critical）
 
-## 数据规格
+**规则冲突处理原则**：Daily Guardrail 的优先级 **必须高于** Agent Level 1 计划。一旦触发，直到下周一 Agent 重新决策前，该板块标记为 `FORBIDDEN_ZONE`。
 
-### Phase 1 输出（已有）
-```
-每条新闻: {datetime, major_category, sub_category, sentiment_score, confidence}
-```
-
-### Phase 2 TCN 数据结构
-
-**输入 X**: `(samples, seq_len=5, n_sub_sectors=47)` — 47 个细分行业情感时序
-**输出 Y**: `(samples, n_meta_sectors=8)` — 8 个元板块动量分数 [-1, 1]
-
-**标签构造**：
 ```python
-# 动量标签：T+1 ~ T+5 日元板块情感均值相对 T 时刻的变化
-meta_sentiment[t+5] = Σ(sub_sentiment_i[t+5] × weight_i)
-momentum = clip((meta_sentiment[t+5] - meta_sentiment[t]) / (|meta_sentiment[t]| + 1e-9), -1, 1)
+# FORBIDDEN_ZONE 状态机
+class SectorStatus(Enum):
+    NORMAL = "normal"
+    FORBIDDEN_ZONE = "forbidden"   # 日 Guardrail 触发，平仓后封禁
+
+# 日 Guardrail 触发后
+if guardrail_triggered(sector):
+    emergency_exit(sector)
+    sector_status[sector] = SectorStatus.FORBIDDEN_ZONE
+    forbidden_until[sector] = next_monday   # 下周一之前禁止重建
+
+# Agent 周一决策时
+for sector in FORBIDDEN_ZONE:
+    # Agent 的 Level 1 计划中，该板块权重强制降为 0
+    agent_plan[sector] = 0
+    agent_plan[sector] += f"[FORBIDDEN_ZONE overridden: {reason}]"
 ```
 
-### Phase 2 数据结构
-
-**情感时序（47 → 8 聚合后）**：
-```
-日期 | 元板块 | 情感均值 | 情感std | 新闻数量 | 平均置信度
-```
-
-**TCN 输出**：8 元板块 × 动量分数 [-1, 1]
-
-**Isolation Forest 输出**：8 元板块 × 热度异常 [0, 1]
-
-**LightGBM 输出**：8 元板块 × 综合信号（方向预测）
-
-### Phase 3 LLM 输入结构
-
-```
-## 元板块综合信号（LightGBM 输出）
-- 科技成长: 综合=0.65, 动量=0.42, 热度=0.65, 趋势=1
-- 金融周期: 综合=-0.30, 动量=-0.15, 热度=0.30, 趋势=0
-- 消费价值: 综合=0.20, 动量=0.10, 热度=0.40, 趋势=1
-...
-
-## 历史动量轨迹（TCN，近4周）
-- 科技成长: [0.20, 0.30, 0.35, 0.42]  ← 持续上行
-- 金融周期: [0.10, 0.05, -0.10, -0.15] ← 持续下行
-...
-
-## 高置信度新闻摘要（每元板块 top 1 条）
-### 科技成长
-- [positive] 0.92 | 半导体国产替代加速... | 降息, 银行, 存款
-- [negative] 0.78 | 美国扩大芯片出口管制... | 半导体, 出口管制
-...
-
-## 当前持仓
-上周持仓: 科技成长 30%, 消费价值 25%
-上周收益: +2.3%
-已投权重: 55%
-```
-
-### LLM 决策输出格式
-
-```json
-{
-  "level1_plan": [
-    {
-      "meta_sector": "科技成长",
-      "action": "buy",
-      "weight_change": 0.15,
-      "reason": "动量持续上行4周，新闻高置信度正面，国产替代政策持续加码"
-    },
-    {
-      "meta_sector": "金融周期",
-      "action": "sell",
-      "weight_change": -0.10,
-      "reason": "动量连续下行，降息预期消化充分"
-    },
-    {
-      "meta_sector": "消费价值",
-      "action": "hold",
-      "weight_change": 0.0,
-      "reason": "动量平稳，新闻无显著方向"
-    }
-  ],
-  "level2_plan": [
-    {
-      "meta_sector": "科技成长",
-      "selected_etf_1": {"code": "159805", "name": "芯片ETF", "tracking_index": "中华半导体芯片指数", "aum": 45.2, "tracking_error": 0.02},
-      "selected_etf_2": {"code": "512760", "name": "芯片ETF", "tracking_index": "费城半导体指数", "aum": 32.1, "tracking_error": 0.03}
-    }
-  ],
-  "reasoning_summary": "科技成长动量持续4周上行，今日国产替代政策利好，符合预期差买入逻辑..."
-}
-```
+**为什么这样设计**：
+- 防止 Agent 在周内"反复申购"同一板块（情绪化操作）
+- 突发利空需要 3-5 天消化期，强行持有只会放大亏损
+- 保留 `reason` 字段供复盘：LLM 需要知道"为什么被禁止"，才能在下次避免类似情况
 
 ---
 
-## 8 元板块正式定义
-
-| 元板块 | 代码 | 包含核心细分 | Beta | 驱动逻辑 |
-|--------|------|-------------|------|---------|
-| 科技成长 | Alpha Tech | 半导体、人工智能、计算机软件、云计算 | Very High | TMT 核心，对流动性和情绪最敏感 |
-| 高端制造 | Hard Tech | 军工、新能源、机器人、航空航天 | Very High | 政策驱动 + 制造业景气度 |
-| 大消费 | Consumption | 食品饮料、医药健康、旅游、文娱 | Medium | 顺周期指标，受内需和人口逻辑驱动 |
-| 红利/中特估 | Value/SOE | 央企/国企、银行、能源、基建、ESG | Low | 避险属性，受利率环境和分红率影响 |
-| 金融地产 | Financial | 非银金融、地产、建筑 | Low/Med | 强政策博弈，杠杆率和信用周期的风向标 |
-| 周期资源 | Resources | 化工、有色金属、钢铁、煤炭 | Medium | 全球大宗商品价格 + 通胀预期 |
-| 智能网联 | Smart Mobility | 新能车、物联网、汽车零部件 | High | 跨行业硬件+软件结合部 |
-| 区域经济 | Regional | 长三角、大湾区、成渝等 | Medium | 宏观叙事，通常作为防守或特定政策观察点 |
-
----
-
-## 实现步骤
+## 实现步骤更新
 
 ### Phase 1: 模型训练基础设施
 - [x] `data/industry_dict.json`（已存在）
 - [ ] 新建 `data/meta_sector_mapping.json`（47 细分 → 8 元板块 + 权重）
 - [ ] 修改 `trainer/signals/dataset.py`：
-  - 输入改为 47 维细分情感时序，6 通道
+  - 输入改为 47 维细分情感时序
   - 输出改为 8 维元板块动量标签
-  - **新增 `export_phase2_dataset()`**：导出每日特征用于 Agent 训练
+  - **新增 Phase 2 数据导出模式**：`export_phase2_dataset()` 导出每日特征用于 Agent 训练
 - [ ] 训练 TCN（47 → 8 维，学习跨行业传导）
 - [ ] 训练 IForest + LightGBM
 - [ ] ONNX 导出
@@ -501,7 +390,7 @@ momentum = clip((meta_sentiment[t+5] - meta_sentiment[t]) / (|meta_sentiment[t]|
 - [ ] 新建 `src/agent/features.py`：`build_agent_features()` 构建 A/B/C/D/E 五类特征
 - [ ] 新建 `src/agent/decision_logger.py`：记录每周决策 + 实际收益 + Guardrail 事件
 - [ ] 修改 `decide_node`：
-  - 改为**每周一决策**模式
+  - 改为**每周一决策**模式（不是每日）
   - Few-shot Prompt 注入好的/坏的决策 pattern
   - 决策前先过"决策逻辑检查清单"
 - [ ] 新建 `src/agent/daily_guardrail.py`：日频监控紧急退出逻辑
@@ -509,7 +398,7 @@ momentum = clip((meta_sentiment[t+5] - meta_sentiment[t]) / (|meta_sentiment[t]|
 - [ ] 分析 decision_log，提取 good/bad patterns，每 4 周更新一次 Prompt
 - [ ] Phase 2 末 4 周验证集评估
 
-### Phase 3: 最终回测
+### Phase 3: 最终回测（不变）
 - [ ] 在 Phase 3 数据上运行完整 pipeline
 - [ ] 计算夏普比率、最大回撤、胜率等指标
 - [ ] 对比"Phase 2 调优 Prompt"vs"未调优 Prompt"的表现差异
@@ -523,8 +412,9 @@ momentum = clip((meta_sentiment[t+5] - meta_sentiment[t]) / (|meta_sentiment[t]|
 | `data/meta_sector_mapping.json` | **新建**：47 细分 → 8 元板块 + 权重 |
 | `trainer/signals/dataset.py` | 重构 TCN 数据集（47 维输入，8 维输出，6 通道）；**新增 `export_phase2_dataset()`** |
 | `src/agent/features.py` | **新建**：`build_agent_features()` 构建 A/B/C/D/E 五类特征 |
-| `src/agent/decision_logger.py` | **新建**：记录每周决策 + 实际收益 + Guardrail 事件 |
-| `src/agent/daily_guardrail.py` | **新建**：日频紧急退出监控逻辑 |
+| `src/agent/decision_logger.py` | **新建**：记录每周决策 + 实际收益 + Guardrail 事件 + **TCN_Prediction_Error** |
+| `src/agent/daily_guardrail.py` | **新建**：日频紧急退出监控逻辑 + **FORBIDDEN_ZONE 状态机** |
+| `src/agent/state.py` | 新增 `SectorStatus` 枚举（NORMAL / FORBIDDEN_ZONE） |
 | `src/agent/tools.py` | 新增 `build_decision_context`（调用 `features.py`）|
 | `src/agent/single_agent.py` | 重构 `decide_node`：改为**每周一决策**模式 |
 | `src/agent/rule_engine.py` | 新建 Guardrail 规则引擎（周决策 + 日监控双模式）|
@@ -535,30 +425,15 @@ momentum = clip((meta_sentiment[t+5] - meta_sentiment[t]) / (|meta_sentiment[t]|
 
 ## 验证方式
 
-### 指标 1：信号连续性
-对比"半导体"细分情感曲线 vs "科技成长"元板块情感曲线。
-- **预期**：元板块曲线更平滑，NaN 更少
-- **意义**：加权聚合确实在平滑噪声
+1. **Phase 2 决策质量追踪**：
+   - 每周记录 `signal_alignment * actual_return` 的相关性
+   - 预期：调优后 Prompt 的相关性 > 调优前
 
-### 指标 2：IC (Information Coefficient) 提升
-计算"元板块情感动量"与"该板块下所有 ETF 平均收益率"的相关性。
-- **预期**：聚合后的 IC > 单一细分的 IC
-- **意义**：降维聚合确实提取了更稳定的预测信号
+2. **Phase 3 回测指标**：
+   - 夏普比率 > 1.0
+   - 最大回撤 < 15%
+   - 与等权基准对比：超额收益 > 5%
 
-### 指标 3：计算稳定性
-观察 LightGBM 特征重要性排序。
-- **预期**："元板块信号"能排进 Top 5
-- **意义**：降维后的特征确实抓住了市场核心逻辑
-
-### 指标 4：Phase 2 决策质量追踪
-- 每周记录 `signal_alignment * actual_return` 的相关性
-- 预期：调优后 Prompt 的相关性 > 调优前
-
-### 指标 5：Phase 3 回测指标
-- 夏普比率 > 1.0
-- 最大回撤 < 15%
-- 与等权基准对比：超额收益 > 5%
-
-### 指标 6：Agent 冷启动验证
-- Phase 2 首 2 周 warm-up 期的决策分布
-- 预期：warm-up 期决策较保守（低权重、高 HOLD 比例）
+3. **Agent 冷启动验证**：
+   - Phase 2 首 2 周 warm-up 期的决策分布
+   - 预期：warm-up 期决策较保守（低权重、高 HOLD 比例）

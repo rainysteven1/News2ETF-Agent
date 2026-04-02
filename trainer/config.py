@@ -1,130 +1,34 @@
-"""Trainer configuration -- Pydantic models loaded from config.toml (project root).
-
-No dependency on src/ -- trainer is fully standalone.
-
-TOML structure:
-  [signals.model]       -> LSTMWithAttention hyperparameters
-  [signals.training]     -> LSTM training hyperparameters
-  [signals.isolation_forest]
-  [signals.lightgbm]
-  [finbert.model]        -> FinBERT model hyperparameters
-  [finbert.training]     -> FinBERT training hyperparameters
-  [data]                 -> data output paths
-"""
+# Trainer configuration — shared configs (Wandb, Predict).
+# Model-specific configs live in their own modules:
+#   trainer.signals.config   -> SignalsConfig (TCN, LightGBM, IsolationForest, Dataset, OHLCV)
+#   trainer.finbert.config   -> FinBERTConfig (model + training)
+#   trainer.setfit_module.config -> SetFitConfig (model + training)
 
 from __future__ import annotations
 
-import json
-import tomllib
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel
 
-_ROOT = Path(__file__).resolve().parent.parent
+from trainer.finbert.config import FinBERTConfig
+from trainer.setfit_module.config import SetFitConfig
+from trainer.signals.config import SignalsConfig
+
+# ─── WandB ──────────────────────────────────────────────────────────────────────
 
 
-# ─── Signals (LSTM pipeline) ────────────────────────────────────────────────────────
+class WandbConfig(BaseModel):
+    mode: Literal["online", "offline", "disabled"] = "online"
+    project: str = "news2etf"
+    entity: str | None = None
+    tags: list[str] = []
 
 
-class SignalsTCNConfig(BaseModel):
-    """TCN hyperparameters."""
-
-    sequence_length: int = 5
-    hidden_size: int = 64
-    num_layers: int = 2
-    dropout: float = 0.2
+# ─── Predict ───────────────────────────────────────────────────────────────────
 
 
-class SignalsTrainingConfig(BaseModel):
-    """LSTM + Attention training hyperparameters."""
-
-    epochs_pretrain: int = 15
-    epochs_finetune: int = 10
-    batch_size: int = 64
-    lr: float = 0.001
-    num_heads: int = 4
-    anomaly_threshold: float = 0.03
-    output_checkpoint: Path | None = None
-
-
-class SignalsIsolationForestConfig(BaseModel):
-    contamination: float = 0.1
-    n_estimators: int = 100
-
-
-class SignalsLightGBMConfig(BaseModel):
-    num_leaves: int = 31
-    learning_rate: float = 0.05
-    n_estimators: int = 200
-
-
-class SignalsDatasetConfig(BaseModel):
-    """Dataset config for signals pipeline."""
-    raw_data_path: Path | None = None
-    output_sentiment: Path | None = None  # aggregated sentiment parquet; if exists, load directly
-    train_end_week: str = "2021-01-03"
-    freq: str = "weekly"  # "weekly" or "daily"
-    cross_industry: bool = True  # pool all industries into one TCN for pretrain
-
-
-# ─── FinBERT ──────────────────────────────────────────────────────────────────────
-
-
-class FinBERTModelConfig(BaseModel):
-    pretrained_model: str = "bert-base-chinese"
-    num_level1: int = 8
-    num_sentiment: int = 3
-    max_seq_length: int = 128
-    dropout: float = 0.1
-
-
-class FinBERTTrainingConfig(BaseModel):
-    raw_data_path: Path | None = None
-    output_dir: Path | None = None
-    batch_size: int = 32
-    early_stopping_patience: int = 1
-    epochs_phase1: int = 3
-    epochs_phase2: int = 5
-    bert_lr: float = 2e-5
-    heads_lr: float = 1e-4
-    weight_decay: float = 0.01
-    warmup_ratio: float = 0.1
-    grad_accum_steps: int = 1
-    max_grad_norm: float = 1.0
-    fp16: bool = True
-    seed: int = 42
-    use_content: bool = False
-
-
-# ─── SetFit ─────────────────────────────────────────────────────────────────────────
-
-
-class SetFitModelConfig(BaseModel):
-    """SetFit model hyperparameters."""
-
-    pretrained_model: str = "sentence-transformers/paraphrase-multilingual-mpnet-base-v2"
-    label_stats: Path = _ROOT / "label_stats.json"
-    max_seq_length: int = 256
-
-
-class SetFitTrainingConfig(BaseModel):
-    """SetFit training hyperparameters."""
-
-    raw_data_path: Path | None = None
-    output_dir: Path | None = None
-    test_size: float = 0.2
-    seed: int = 42
-    batch_size: int = 16
-    num_iterations: int = 20
-    num_epochs: int = 1
-    learning_rate: float = 2e-5
-    min_samples_per_class: int = 2
-
-
-class PredictConfig(BaseModel):
-    """Batch inference config for FinBERT + SetFit ONNX labeling."""
-
+class PredictionConfig(BaseModel):
     finbert_onnx_dir: Path | None = None
     finbert_output_path: Path | None = None
     finbert_workers: int = 8
@@ -136,156 +40,96 @@ class PredictConfig(BaseModel):
     setfit_max_length: int = 256
 
 
-# ─── WandB ──────────────────────────────────────────────────────────────────────
-
-
-class WandbConfig(BaseModel):
-    project: str = "news2etf"
-    entity: str | None = None
-    name: str | None = None
-    mode: str = "online"  # "online" | "offline" | "disabled"
-
-
-# ─── Data paths ──────────────────────────────────────────────────────────────────
-
-
-class DataConfig(BaseModel):
-    output_sentiment: Path = _ROOT / "data" / "industry_sentiment.parquet"
-    output_signals: Path = _ROOT / "data" / "ml_signals.parquet"
-    output_backtest: Path = _ROOT / "data" / "backtest_results.parquet"
-    output_weekly_returns: Path = _ROOT / "data" / "weekly_returns.parquet"
-
-
-# ─── Root config ───────────────────────────────────────────────────────────────────
+# ─── Trainer Root Config ───────────────────────────────────────────────────────
 
 
 class TrainerConfig(BaseModel):
+    app: Literal["finbert", "setfit", "signals"] = "finbert"
+    seed: int = 42
     wandb: WandbConfig = WandbConfig()
-    tcn: SignalsTCNConfig = SignalsTCNConfig()
-    training: SignalsTrainingConfig = SignalsTrainingConfig()
-    isolation_forest: SignalsIsolationForestConfig = SignalsIsolationForestConfig()
-    lightgbm: SignalsLightGBMConfig = SignalsLightGBMConfig()
-    dataset: SignalsDatasetConfig = SignalsDatasetConfig()
-    finbert: FinBERTModelConfig = FinBERTModelConfig()
-    finbert_training: FinBERTTrainingConfig = FinBERTTrainingConfig()
-    setfit: SetFitModelConfig = SetFitModelConfig()
-    setfit_training: SetFitTrainingConfig = SetFitTrainingConfig()
-    data: DataConfig = DataConfig()
-    predict: PredictConfig = PredictConfig()
+    finbert: FinBERTConfig = FinBERTConfig()
+    setfit: SetFitConfig = SetFitConfig()
+    signals: SignalsConfig = SignalsConfig()
+    prediction: PredictionConfig = PredictionConfig()
+
+    def to_wandb(self):
+        config: dict[str, Any] = {
+            "seed": self.seed,
+        }
+
+        if self.app == "finbert":
+            config["finbert"] = self.finbert.to_wandb()
+
+        return config
 
 
 def load_config(path: str | Path | None = None) -> TrainerConfig:
-    """Load trainer/config.toml and resolve relative paths against the project root."""
+    """Load trainer/config.toml and resolve relative paths.
+
+    Only loads shared configs (wandb, predict). Model configs are loaded
+    via their own load_*_config() functions from sub-modules.
+    """
+    import tomllib
+
     if path is None:
-        path = _ROOT / "trainer" / "config.toml"
-    path = Path(path)
-    print(path)
+        path = Path(__file__).resolve().parent / "config.toml"
 
     with open(path, "rb") as f:
-        raw: dict = tomllib.load(f)
+        raw: dict[str, Any] = tomllib.load(f)
 
-    # Map TOML section names to TrainerConfig field names
-    toml_to_field = {
-        "wandb": "wandb",
-        "signals.tcn": "tcn",
-        "signals.training": "training",
-        "signals.isolation_forest": "isolation_forest",
-        "signals.lightgbm": "lightgbm",
-        "signals.dataset": "dataset",
-        "finbert.model": "finbert",
-        "finbert.training": "finbert_training",
-        "setfit.model": "setfit",
-        "setfit.training": "setfit_training",
-        "data": "data",
-        "predict": "predict",
-    }
+    filtered: dict[str, Any] = {}
 
-    filtered: dict = {}
-    for toml_key, field_name in toml_to_field.items():
-        parts = toml_key.split(".")
-        val = raw
-        for p in parts:
-            val = val.get(p, {})
-        if val:
-            filtered[field_name] = val
+    if "wandb" in raw:
+        filtered["wandb"] = raw["wandb"]
 
-    cfg = TrainerConfig.model_validate(filtered)
+    if "predict" in raw:
+        _ROOT = Path(__file__).resolve().parent
+        predict_section = raw["predict"]
+        resolved: dict[str, Any] = {}
+        for key, val in predict_section.items():
+            if key.endswith("_path") or key.endswith("_dir") or key.endswith("_file"):
+                resolved[key] = _ROOT / val
+            else:
+                resolved[key] = val
+        filtered["predict"] = resolved
 
-    # Resolve relative data paths to absolute
-    data_section = raw.get("data", {})
-    for key in (
-        "output_sentiment",
-        "output_signals",
-        "output_backtest",
-        "output_weekly_returns",
-    ):
-        if key in data_section:
-            resolved = _ROOT / data_section[key]
-            setattr(cfg.data, key, resolved)
-
-    # Resolve finbert training raw_data_path and output_dir
-    finbert_section = raw.get("finbert", {}).get("training", {})
-    if "raw_data_path" in finbert_section:
-        cfg.finbert_training.raw_data_path = _ROOT / finbert_section["raw_data_path"]
-    if "output_dir" in finbert_section:
-        cfg.finbert_training.output_dir = _ROOT / finbert_section["output_dir"]
-
-    # Resolve setfit training raw_data_path
-    setfit_section = raw.get("setfit", {}).get("training", {})
-    if "raw_data_path" in setfit_section:
-        cfg.setfit_training.raw_data_path = _ROOT / setfit_section["raw_data_path"]
-
-    # Resolve signals dataset raw_data_path and output_sentiment
-    dataset_section = raw.get("signals", {}).get("dataset", {})
-    if "raw_data_path" in dataset_section:
-        cfg.dataset.raw_data_path = _ROOT / dataset_section["raw_data_path"]
-    if "output_sentiment" in dataset_section:
-        cfg.dataset.output_sentiment = _ROOT / dataset_section["output_sentiment"]
-
-    # Resolve signals training output_checkpoint
-    training_section = raw.get("signals", {}).get("training", {})
-    if "output_checkpoint" in training_section:
-        cfg.training.output_checkpoint = _ROOT / training_section["output_checkpoint"]
-
-    # Resolve predict paths
-    predict_section = raw.get("predict", {})
-    for key in ("finbert_onnx_dir", "finbert_output_path", "setfit_base_dir", "input_path", "output_path"):
-        if key in predict_section:
-            resolved = _ROOT / predict_section[key]
-            setattr(cfg.predict, key, resolved)
-
-    return cfg
+    return TrainerConfig.model_validate(filtered)
 
 
-# ─── Shared utilities ───────────────────────────────────────────────────────────
+# ── Module-level singleton ─────────────────────────────────────────────────────
 
 
-class LabelStats:
-    """Load and access label_stats.json via config.toml key (singleton)."""
+_config_instance: TrainerConfig | None = None
 
-    _instance: "LabelStats | None" = None
-    _initialized: bool = False
 
-    def __new__(cls, stats_path: Path | None = None) -> "LabelStats":
-        if cls._instance is None:
-            instance = super().__new__(cls)
-            cls._instance = instance
-        return cls._instance
+def init_config(app: Literal["finbert", "setfit", "signals"], config_path: str | None = None) -> None:
+    """Initialize the singleton config from a TOML or JSON config file."""
+    global _config_instance
+    if config_path is None:
+        root_dir = Path(__file__).parent
+        cfg_path = root_dir / "config.toml"
+    else:
+        cfg_path = Path(config_path)
 
-    def __init__(self, stats_path: Path | None = None):
-        if LabelStats._initialized:
-            return
-        if stats_path is None:
-            cfg = load_config()
-            stats_path = cfg.setfit.label_stats
-        with open(stats_path, encoding="utf-8") as f:
-            self._stats: dict[str, Any] = json.load(f)
-        LabelStats._initialized = True
+    raw: dict[str, Any] | None = None
+    if cfg_path.suffix == ".toml":
+        import tomllib
 
-    def get_major_categories(self) -> list[str]:
-        """Return sorted list of major categories."""
-        return sorted(self._stats["major_category"].keys())
+        with open(cfg_path, "rb") as f:
+            raw = tomllib.load(f)
 
-    def get_sub_categories(self, major: str) -> list[str]:
-        """Return sorted list of sub-categories for a major."""
-        return sorted(self._stats["sub_category_by_major"][major].keys())
+    assert raw is not None, f"Unsupported config file format: {cfg_path.suffix}"
+    _config_instance = TrainerConfig.model_validate(raw)
+
+    _config_instance.app = app
+
+    if app == "finbert":
+        _config_instance.wandb.tags = ["finbert"]
+    elif app == "signals":
+        _config_instance.wandb.tags = ["signals"]
+
+
+def get_config() -> TrainerConfig:
+    """Return the singleton config. Must call init_config() first."""
+    assert _config_instance is not None, "Config not initialized. Call init_config() first."
+    return _config_instance

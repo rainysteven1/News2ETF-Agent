@@ -16,15 +16,13 @@ from typing import Any
 import polars as pl
 import torch
 from datasets import Dataset
-from loguru import logger
 from sentence_transformers.losses import CosineSimilarityLoss
 from setfit import SetFitModel, SetFitTrainer
 
-from trainer.config import LabelStats, SetFitModelConfig, SetFitTrainingConfig
-from trainer.config import load_config as load_trainer_config
+from trainer.logger import get_logger
+from trainer.setfit_module.config import LabelStats, SetFitModelConfig, SetFitTrainingConfig
 from trainer.setfit_module.model import _safe_name, export_setfit_to_onnx
 from trainer.utils.seed import set_seed
-from trainer.wandb_handler import WandbHandler
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -67,9 +65,9 @@ def train_setfit_for_major(
     mcfg: SetFitModelConfig,
     tcfg: SetFitTrainingConfig,
     device: torch.device,
-    wb: WandbHandler,
 ) -> dict[str, Any]:
     """Train and save a SetFit model for one major category. Returns metrics."""
+    logger = get_logger()
     logger.info(f"[SetFit] Training for major: {major}")
 
     dataset, unique_labels = prepare_hf_dataset(df, major)
@@ -184,11 +182,13 @@ def train_per_major() -> dict[str, dict[str, Any]]:
     Each major category gets its own wandb run (tags: setfit + <major>).
     GPU memory is released after each major to avoid OOM.
     """
-    cfg = load_trainer_config()
+    from trainer.config import load_config as load_wandb_config
 
-    mcfg = cfg.setfit
-    tcfg = cfg.setfit_training
-    wcfg = cfg.wandb
+    setfit_cfg = load_setfit_config()
+    wandb_cfg = load_wandb_config().wandb
+
+    mcfg = setfit_cfg.model
+    tcfg = setfit_cfg.training
 
     set_seed(tcfg.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -213,9 +213,9 @@ def train_per_major() -> dict[str, dict[str, Any]]:
         run_output_dir = run_prefix_dir / _safe_name(major)
         run_output_dir.mkdir(parents=True, exist_ok=True)
 
-        wb = WandbHandler(
-            project=wcfg.project,
-            entity=wcfg.entity,
+        init_wandb_handler(
+            project=wandb_cfg.project,
+            entity=wandb_cfg.entity,
             name=run_name,
             config_dict={
                 "pretrained_model": mcfg.pretrained_model,
@@ -225,8 +225,9 @@ def train_per_major() -> dict[str, dict[str, Any]]:
                 "learning_rate": tcfg.learning_rate,
             },
             tags=["setfit", major],
-            mode=cfg.wandb.mode,
+            mode=wandb_cfg.mode,
         )
+        wb = get_wandb_handler()
 
         result = train_setfit_for_major(df, major, run_output_dir, mcfg, tcfg, device, wb)
         results[major] = result

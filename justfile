@@ -14,18 +14,18 @@ gpu-sync:
 # ── Inference / Debug ───────────────────────────────────────────────────────────
 
 decide week:
-    python main.py decide --week {{week}}
+    python main.py decide --week {{ week }}
 
 backtest start end:
-    python main.py backtest --start-date {{start}} --end-date {{end}}
+    python main.py backtest --start-date {{ start }} --end-date {{ end }}
 
 # ── Trainer CLI (trainer/main.py) ──────────────────────────────────────────────
 
-signals-train:
-    python -m trainer.main signals-train
-
 finbert-train:
-    python -m trainer.main finbert-train 
+    python -m trainer.main finbert train 
 
 setfit-train:
-    python -m trainer.main setfit-train
+    python -m trainer.main setfit train
+
+signals-train:
+    python -m trainer.main signals train

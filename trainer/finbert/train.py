@@ -19,15 +19,15 @@ from typing import Any
 
 import numpy as np
 import torch
-from loguru import logger
-from torch.cuda.amp import GradScaler, autocast
+import torch.optim as optim
+from torch.amp.autocast_mode import autocast
+from torch.amp.grad_scaler import GradScaler
 from torch.nn.utils.clip_grad import clip_grad_norm_
-from torch.optim import AdamW
 from torch.utils.data import DataLoader
 from transformers import AutoTokenizer
 from transformers.optimization import get_linear_schedule_with_warmup
 
-from trainer.config import FinBERTModelConfig, FinBERTTrainingConfig, TrainerConfig
+from trainer.config import get_config
 from trainer.finbert.dataset import (
     IDX_TO_L1,
     L1_TO_IDX,
@@ -36,7 +36,8 @@ from trainer.finbert.dataset import (
     preprocess_split,
 )
 from trainer.finbert.model import FinBERTClassifier, load_finbert_classifier
-from trainer.wandb_handler import WandbHandler
+from trainer.logger import get_logger
+from trainer.wandb_handler import WandbRegistry
 
 # ─── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -135,37 +136,32 @@ def evaluate(
 def freeze_bert(model: FinBERTClassifier) -> None:
     for param in model.bert.parameters():
         param.requires_grad = False
-    logger.info("[FinBERT] BERT backbone frozen (Phase 1)")
+    get_logger().info("[FinBERT] BERT backbone frozen (Phase 1)")
 
 
 def unfreeze_bert(model: FinBERTClassifier) -> None:
     for param in model.bert.parameters():
         param.requires_grad = True
-    logger.info("[FinBERT] BERT backbone unfrozen (Phase 2)")
+    get_logger().info("[FinBERT] BERT backbone unfrozen (Phase 2)")
 
 
 # ─── Main training function ───────────────────────────────────────────────────
 
 
-def train_finbert() -> dict[str, Path]:
+def train_finbert(device: torch.device) -> None:
     """Train FinBERT on labeled news data.
 
-    Returns dict with paths to best checkpoint and ONNX model.
+    Returns dict with path to best checkpoint (or None if save_checkpoint=False).
     """
-    from trainer.config import load_config as load_trainer_config
+    cfg = get_config()
+    logger = get_logger()
 
-    cfg = load_trainer_config()
-
-    mcfg = cfg.finbert
-    tcfg = cfg.finbert_training
-    wcfg = cfg.wandb
-
-    if tcfg.raw_data_path is None:
-        raise ValueError("raw_data_path must be set via config.toml [finbert.training] raw_data_path")
-
-    set_seed(tcfg.seed)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info(f"[FinBERT] Device: {device}")
+
+    finbert_cfg = cfg.finbert
+    dcfg = finbert_cfg.data
+    mcfg = finbert_cfg.model
+    tcfg = finbert_cfg.training
 
     # Generate run name early so we can use it for the output directory
     # (matches WandbHandler's auto-naming convention)
@@ -175,55 +171,39 @@ def train_finbert() -> dict[str, Path]:
     )
     run_output_dir.mkdir(parents=True, exist_ok=True)
 
-    wb = WandbHandler(
-        project=wcfg.project,
-        entity=wcfg.entity,
-        name=run_name,
-        config_dict={
-            "pretrained_model": mcfg.pretrained_model,
-            "num_level1": mcfg.num_level1,
-            "num_sentiment": mcfg.num_sentiment,
-            "max_seq_length": mcfg.max_seq_length,
-            "dropout": mcfg.dropout,
-            "batch_size": tcfg.batch_size,
-            "bert_lr": tcfg.bert_lr,
-            "heads_lr": tcfg.heads_lr,
-            "epochs_phase1": tcfg.epochs_phase1,
-            "epochs_phase2": tcfg.epochs_phase2,
-        },
-        tags=["finbert"],
-        mode=wcfg.mode,
-    )
+    wb = WandbRegistry.get("finbert")
 
     tokenizer = AutoTokenizer.from_pretrained(mcfg.pretrained_model)
 
-    preprocess_split(tcfg.raw_data_path, run_output_dir, val_ratio=0.15, seed=tcfg.seed)
+    assert dcfg.raw_data_dir is not None, "raw_data_dir must be set in config for data preprocessing"
+
+    preprocess_split(dcfg.raw_data_dir / "raw.parquet", val_ratio=dcfg.val_ratio, seed=cfg.seed)
     train_ds = NewsClassificationDataset(
-        tcfg.raw_data_path / "train.parquet",
+        dcfg.raw_data_dir / "train.parquet",
         tokenizer,
         max_length=mcfg.max_seq_length,
         l1_to_idx=L1_TO_IDX,
-        use_content=tcfg.use_content,
+        use_content=dcfg.use_content,
     )
     val_ds = NewsClassificationDataset(
-        tcfg.raw_data_path / "val.parquet",
+        dcfg.raw_data_dir / "val.parquet",
         tokenizer,
         max_length=mcfg.max_seq_length,
         l1_to_idx=L1_TO_IDX,
-        use_content=tcfg.use_content,
+        use_content=dcfg.use_content,
     )
     logger.info(f"[FinBERT] Train: {len(train_ds)}, Val: {len(val_ds)}")
 
     train_loader = DataLoader(
         train_ds,
-        batch_size=tcfg.batch_size,
+        batch_size=dcfg.batch_size,
         shuffle=True,
         num_workers=4,
         pin_memory=True,
     )
     val_loader = DataLoader(
         val_ds,
-        batch_size=tcfg.batch_size,
+        batch_size=dcfg.batch_size,
         shuffle=False,
         num_workers=4,
         pin_memory=True,
@@ -239,7 +219,7 @@ def train_finbert() -> dict[str, Path]:
     )
     model.to(device)
 
-    scaler = GradScaler(enabled=tcfg.fp16 and device.type == "cuda")
+    scaler = GradScaler(enabled=tcfg.fp16 and device == "cuda", device=device.type)
     patience = tcfg.early_stopping_patience
     no_decay = {"bias", "LayerNorm.weight", "LayerNorm.bias"}
 
@@ -262,7 +242,7 @@ def train_finbert() -> dict[str, Path]:
         else:
             heads_params_decay.append(param)
 
-    optimizer = AdamW(
+    optimizer = optim.AdamW(
         [
             {"params": heads_params_decay, "lr": tcfg.heads_lr, "weight_decay": tcfg.weight_decay},
             {"params": heads_params_no_decay, "lr": tcfg.heads_lr, "weight_decay": 0.0},
@@ -281,7 +261,7 @@ def train_finbert() -> dict[str, Path]:
         for step, batch in enumerate(train_loader):
             batch = {k: v.to(device) for k, v in batch.items()}
 
-            with autocast(enabled=tcfg.fp16 and device.type == "cuda"):
+            with autocast(enabled=tcfg.fp16 and device.type == "cuda", device_type=device.type):
                 outputs = model(
                     input_ids=batch["input_ids"],
                     attention_mask=batch["attention_mask"],
@@ -307,7 +287,7 @@ def train_finbert() -> dict[str, Path]:
             if global_step > 0 and global_step % 50 == 0:
                 lr = scheduler.get_last_lr()[0]
                 logger.info(
-                    f"  [P1 {epoch + 1}] step {global_step} "
+                    f"  [P1 {epoch + 1}] batch= {step + 1}/{len(train_loader)} "
                     f"loss={outputs['loss'].item():.4f} "
                     f"l1={outputs['l1_loss'].item():.4f} "
                     f"sent={outputs.get('sentiment_loss', torch.tensor(0)).item():.4f} "
@@ -319,18 +299,16 @@ def train_finbert() -> dict[str, Path]:
         val_metrics = evaluate(model, val_loader, device)
         logger.info(
             f"P1 Epoch {epoch + 1}/{tcfg.epochs_phase1} {elapsed:.1f}s — "
-            f"loss={avg_loss:.4f}, val_l1={val_metrics.l1_accuracy:.4f}, "
-            f"val_sent={val_metrics.sentiment_accuracy:.4f}"
+            f"loss={avg_loss:.4f}, val_l1_acc={val_metrics.l1_accuracy:.4f}, "
+            f"val_sent_acc={val_metrics.sentiment_accuracy:.4f}"
         )
-        wb.log_epoch(
-            "P1",
-            epoch + 1,
-            avg_loss,
+        wb.log_metrics(
             {
-                "train/l1_loss": outputs.get("l1_loss", torch.tensor(0)).item(),
-                "train/sentiment_loss": outputs.get("sentiment_loss", torch.tensor(0)).item(),
-                "epoch/val_l1_accuracy": val_metrics.l1_accuracy,
-                "epoch/val_sentiment_accuracy": val_metrics.sentiment_accuracy,
+                "P1/train_l1_loss": outputs.get("l1_loss", torch.tensor(0)).item(),
+                "P1/train_sent_loss": outputs.get("sentiment_loss", torch.tensor(0)).item(),
+                "P1/val_l1_acc": val_metrics.l1_accuracy,
+                "P1/val_sent_acc": val_metrics.sentiment_accuracy,
+                "P1/epoch": epoch + 1,
             },
         )
 
@@ -338,10 +316,13 @@ def train_finbert() -> dict[str, Path]:
         if improved:
             best_val_l1_acc = val_metrics.l1_accuracy
             best_val_sent_acc = val_metrics.sentiment_accuracy
-            best_dir = run_output_dir / "best"
-            model.save_pretrained(best_dir)
-            tokenizer.save_pretrained(best_dir)
-            logger.success(f"  ✓ Best saved (l1_acc={best_val_l1_acc:.4f})")
+            if tcfg.save_checkpoint:
+                best_dir = run_output_dir / "best"
+                model.save_pretrained(best_dir)
+                tokenizer.save_pretrained(best_dir)
+                logger.info(f"  ✓ Best saved (l1_acc={best_val_l1_acc:.4f})")
+            else:
+                logger.info(f"  ✓ Best (l1_acc={best_val_l1_acc:.4f}, checkpoint skipped)")
             epochs_without_improvement = 0
         else:
             epochs_without_improvement += 1
@@ -372,7 +353,7 @@ def train_finbert() -> dict[str, Path]:
             else:
                 heads_params_no_decay.append(param)
 
-    optimizer = AdamW(
+    optimizer = optim.AdamW(
         [
             {"params": bert_params_decay, "lr": tcfg.bert_lr, "weight_decay": tcfg.weight_decay},
             {"params": bert_params_no_decay, "lr": tcfg.bert_lr, "weight_decay": 0.0},
@@ -393,7 +374,7 @@ def train_finbert() -> dict[str, Path]:
         for step, batch in enumerate(train_loader):
             batch = {k: v.to(device) for k, v in batch.items()}
 
-            with autocast(enabled=tcfg.fp16 and device.type == "cuda"):
+            with autocast(enabled=tcfg.fp16 and device.type == "cuda", device_type=device.type):
                 outputs = model(
                     input_ids=batch["input_ids"],
                     attention_mask=batch["attention_mask"],
@@ -419,7 +400,7 @@ def train_finbert() -> dict[str, Path]:
             if global_step > 0 and global_step % 50 == 0:
                 lr = scheduler.get_last_lr()[0]
                 logger.info(
-                    f"  [P2 {epoch + 1}] step {global_step} "
+                    f"  [P2 {epoch + 1}] batch= {step + 1}/{len(train_loader)} "
                     f"loss={outputs['loss'].item():.4f} "
                     f"l1={outputs['l1_loss'].item():.4f} "
                     f"sent={outputs.get('sentiment_loss', torch.tensor(0)).item():.4f} "
@@ -431,18 +412,16 @@ def train_finbert() -> dict[str, Path]:
         val_metrics = evaluate(model, val_loader, device)
         logger.info(
             f"P2 Epoch {epoch + 1}/{tcfg.epochs_phase2} {elapsed:.1f}s — "
-            f"loss={avg_loss:.4f}, val_l1={val_metrics.l1_accuracy:.4f}, "
-            f"val_sent={val_metrics.sentiment_accuracy:.4f}"
+            f"loss={avg_loss:.4f}, val_l1_acc={val_metrics.l1_accuracy:.4f}, "
+            f"val_sent_acc={val_metrics.sentiment_accuracy:.4f}"
         )
-        wb.log_epoch(
-            "P2",
-            epoch + tcfg.epochs_phase1 + 1,
-            avg_loss,
+        wb.log_metrics(
             {
-                "train/l1_loss": outputs.get("l1_loss", torch.tensor(0)).item(),
-                "train/sentiment_loss": outputs.get("sentiment_loss", torch.tensor(0)).item(),
-                "epoch/val_l1_accuracy": val_metrics.l1_accuracy,
-                "epoch/val_sentiment_accuracy": val_metrics.sentiment_accuracy,
+                "P2/train_l1_loss": outputs.get("l1_loss", torch.tensor(0)).item(),
+                "P2/train_sent_loss": outputs.get("sentiment_loss", torch.tensor(0)).item(),
+                "P2/val_l1_acc": val_metrics.l1_accuracy,
+                "P2/val_sent_acc": val_metrics.sentiment_accuracy,
+                "P2/epoch": epoch + tcfg.epochs_phase1 + 1,
             },
         )
 
@@ -450,10 +429,13 @@ def train_finbert() -> dict[str, Path]:
         if improved:
             best_val_l1_acc = val_metrics.l1_accuracy
             best_val_sent_acc = val_metrics.sentiment_accuracy
-            best_dir = run_output_dir / "best"
-            model.save_pretrained(best_dir)
-            tokenizer.save_pretrained(best_dir)
-            logger.success(f"  ✓ Best saved (l1_acc={best_val_l1_acc:.4f})")
+            if tcfg.save_checkpoint:
+                best_dir = run_output_dir / "best"
+                model.save_pretrained(best_dir)
+                tokenizer.save_pretrained(best_dir)
+                logger.info(f"✓ Best saved (l1_acc={best_val_l1_acc:.4f})")
+            else:
+                logger.info(f"✓ Best (l1_acc={best_val_l1_acc:.4f}, checkpoint skipped)")
             epochs_without_improvement = 0
         else:
             epochs_without_improvement += 1
@@ -473,43 +455,14 @@ def train_finbert() -> dict[str, Path]:
 
     wb.log_summary(
         {
-            "best_val_l1_accuracy": best_val_l1_acc,
-            "best_val_sentiment_accuracy": best_val_sent_acc,
+            "best_val_l1_acc": best_val_l1_acc,
+            "best_val_sent_acc": best_val_sent_acc,
         }
     )
 
-    # ── Export best model to ONNX ───────────────────────────────────────────────
-    from trainer.finbert.model import export_finbert_to_onnx
-
-    onnx_path = run_output_dir / "best.onnx"
-    try:
-        export_finbert_to_onnx(
-            model_dir=run_output_dir / "best",
-            onnx_path=onnx_path,
-            max_seq_length=mcfg.max_seq_length,
-        )
-
-        # ── Upload ONNX as W&B artifact ─────────────────────────────────────
-        wb.upload_artifact(
-            artifact_path=onnx_path,
-            name=f"finbert-onnx-{run_name}",
-            artifact_type="model",
-            aliases=["latest", "best"],
-        )
-        onnx_status = "exported"
-    except Exception as e:
-        logger.warning(
-            f"[FinBERT] ONNX export failed: {e}, pth checkpoint saved at "
-            f"{run_output_dir / 'best'} for manual conversion"
-        )
-        onnx_path = None
-        onnx_status = "failed"
-
-    wb.finish()
-
+    best_path = run_output_dir / "best" if tcfg.save_checkpoint else None
     logger.info(f"\n[FinBERT] Training complete. Best val L1 accuracy: {best_val_l1_acc:.4f}")
-    logger.info(f"[FinBERT] Best checkpoint: {run_output_dir / 'best'}")
-    if onnx_path:
-        logger.info(f"[FinBERT] ONNX model: {onnx_path}")
-
-    return {"best": run_output_dir / "best", "onnx": onnx_path, "onnx_status": onnx_status}
+    if best_path:
+        logger.info(f"[FinBERT] Best checkpoint: {best_path}")
+    else:
+        logger.info("[FinBERT] Checkpoint saving disabled (save_checkpoint=False)")

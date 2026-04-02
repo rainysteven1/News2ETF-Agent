@@ -10,20 +10,67 @@ Usage:
     python -m trainer.main signals train-lgbm
 """
 
+import functools
 import sys
 from pathlib import Path
 
 # Ensure the project root is on sys.path so 'from trainer.xxx' absolute imports work
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+import random
+from collections.abc import Callable
+
+import numpy as np
+import torch
 import typer
 from dotenv import load_dotenv
 from rich.console import Console
+
+from trainer.config import get_config, init_config
+from trainer.logger import init_logger
+from trainer.wandb_handler import WandbRegistry
 
 load_dotenv()  # Load environment variables from .env file at startup
 
 app = typer.Typer(add_completion=False)
 console = Console()
+
+device: torch.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+def _init_seed(seed: int):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+
+
+def _init_trainer(context: typer.Context) -> None:
+    """Initialize config, logger, and wandb from the parent app name."""
+
+    app_name: str = context.parent.params.get("name", "finbert")  # type: ignore[union-attr]
+    console.print(f"[bold blue]Initializing trainer for app: {app_name}[/bold blue]")
+
+    init_config(app_name)  # type: ignore
+    init_logger()
+
+    if app_name == "setfit":
+        pass
+    else:
+        WandbRegistry.init(app_name, tags=[app_name])
+
+    _init_seed(get_config().seed)
+
+
+def with_trainer_init(func: Callable) -> Callable:
+    """Decorator: initializes config/logger/wandb before running a train command."""
+
+    @functools.wraps(func)
+    def wrapper(ctx: typer.Context, *args, **kwargs):
+        _init_trainer(ctx)
+        func(ctx, *args, **kwargs)
+        WandbRegistry.finish_all()
+
+    return wrapper
 
 
 # ── Signals subapp ────────────────────────────────────────────────────────────
@@ -33,7 +80,9 @@ signals_app = typer.Typer(add_completion=False)
 
 
 @signals_app.command("train")
+@with_trainer_init
 def signals_train(
+    ctx: typer.Context,
     force: bool = typer.Option(False, "--force", "-f", help="Force re-process raw data even if cached parquet exists."),
 ) -> None:
     """Run full TCN pipeline: pretrain → finetune → LightGBM stacking."""
@@ -49,11 +98,12 @@ finbert_app = typer.Typer(add_completion=False)
 
 
 @finbert_app.command("train")
-def finbert_train() -> None:
+@with_trainer_init
+def finbert_train(ctx: typer.Context) -> None:
     """Train FinBERT (8 L1 classes + 3 sentiment) on labeled news data."""
     from trainer.finbert.train import train_finbert
 
-    train_finbert()
+    train_finbert(device=device)
 
 
 @finbert_app.command("export-onnx")
