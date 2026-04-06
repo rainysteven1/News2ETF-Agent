@@ -1,26 +1,4 @@
-"""Standalone W&B handler — runs alongside loguru, not instead of it.
-
-Loguru handles console output (logger.info/success).
-WandbHandler pushes metrics to wandb dashboard.
-Both run simultaneously and independently.
-
-Registry-based multi-instance pattern:
-
-  # FinBERT — single instance
-  WandbRegistry.init("finbert")
-  wb = WandbRegistry.get("finbert")
-
-  # SetFit — one per major, registered upfront
-  WandbRegistry.init("setfit_major1", tags=["setfit", "major1"])
-  WandbRegistry.init("setfit_major2", tags=["setfit", "major2"])
-  wb1 = WandbRegistry.get("setfit_major1")
-  wb2 = WandbRegistry.get("setfit_major2")
-
-  # No-args convenience: uses key="default"
-  WandbRegistry.init()
-  wb = WandbRegistry.get()
-"""
-
+"""Standalone W&B handler — runs alongside loguru, not instead of it."""
 from __future__ import annotations
 
 import os
@@ -32,7 +10,7 @@ from typing import Any
 from loguru import logger
 
 import wandb
-from trainer.config import get_config
+from trainer.src.config import get_config
 
 
 def _generate_wandb_run_name(prefix: str) -> str:
@@ -41,24 +19,37 @@ def _generate_wandb_run_name(prefix: str) -> str:
     return f"{prefix}_{suffix}"
 
 
-# ── Registry ──────────────────────────────────────────────────────────────────
-
-
 class WandbRegistry:
     """Registry for multiple WandbHandler instances."""
 
     _handlers: dict[str, WandbHandler] = {}
+    _logged_in: bool = False
 
     @classmethod
-    def init(cls, key: str = "default", run_name: str | None = None, tags: list[str] | None = None) -> None:
-        """Register (or replace) a named WandbHandler in the registry.
+    def _login(cls) -> None:
+        """Login to W&B using API key from environment variable. Called once globally."""
+        if cls._logged_in:
+            return
+        cfg = get_config().wandb
+        api_key = os.getenv("WANDB_API_KEY")
+        if not api_key and cfg.mode == "online":
+            raise ValueError("W&B API key not found in environment variable 'WANDB_API_KEY'")
 
-        Args:
-            key: Unique identifier for this handler (e.g. "finbert", "setfit_technology").
-                 Subsequent calls with the same key replace the existing handler.
-            tags: Override config.toml tags for this handler only.
-        """
-        handler = WandbHandler(tags=tags)
+        wandb.login(key=api_key)
+        cls._logged_in = True
+
+    @classmethod
+    def init(
+        cls,
+        key: str = "default",
+        run_name: str | None = None,
+        cfg_dict: dict[str, Any] | None = None,
+        tags: list[str] | None = None,
+    ) -> None:
+        """Register (or replace) a named WandbHandler in the registry."""
+        cls._login()
+        handler = WandbHandler()
+        handler.init_run(run_name or _generate_wandb_run_name(key), cfg_dict, tags)
         cls._handlers[key] = handler
 
     @classmethod
@@ -74,58 +65,73 @@ class WandbRegistry:
             handler.finish()
 
 
-# ── Handler ───────────────────────────────────────────────────────────────────
-
-
 class WandbHandler:
-    """W&B metrics handler. Settings come from config.toml, optionally overridden per-instance."""
+    """W&B metrics handler."""
 
-    def __init__(
-        self,
-        run_name: str | None = None,
-        tags: list[str] | None = None,
-    ) -> None:
+    def __init__(self) -> None:
         self._cfg = get_config().wandb
         self._run = None
         self._run_id: str | None = None
 
-        # Override config with explicitly passed values
-        self._tags = tags if tags is not None else self._cfg.tags
-
-        self._login()
-        self._init_run(run_name or _generate_wandb_run_name("trainer"))
-
     @property
     def id(self) -> str | None:
-        """W&B run ID."""
         return self._run_id
 
-    def _login(self):
-        """Login to W&B using API key from environment variable."""
-        api_key = os.getenv("WANDB_API_KEY")
-        if not api_key and self._cfg.mode == "online":
-            raise ValueError("W&B API key not found in environment variable 'WANDB_API_KEY'")
-        wandb.login(key=api_key)
-
-    def _init_run(self, run_name: str):
+    def init_run(
+        self,
+        run_name: str,
+        cfg_dict: dict[str, Any] | None = None,
+        tags: list[str] | None = None,
+    ) -> None:
         self._run = wandb.init(
             project=self._cfg.project,
             entity=self._cfg.entity,
             name=run_name,
-            tags=self._tags,
+            config=cfg_dict,
+            tags=tags,
             mode=self._cfg.mode,
         )
         self._run_id = self._run.id if self._run is not None else None
 
     def log_metrics(self, metrics: dict[str, Any], step: int | None = None) -> None:
-        """Log metrics to wandb dashboard."""
         wandb.log(metrics, step=step)
 
     def log_summary(self, metrics: dict[str, Any]) -> None:
-        """Log summary metrics to W&B run summary."""
         if self._run is not None:
             for key, value in metrics.items():
                 self._run.summary[key] = value
+
+    def log_confusion_matrix(
+        self,
+        cm: list[list[float]],
+        labels: list[str],
+        title: str = "Confusion Matrix",
+    ) -> None:
+        if self._run is None:
+            return
+        import numpy as np
+        import plotly.express as px
+        import plotly.figure_factory as ff
+
+        cm_arr = np.array(cm) * 100
+        fig = ff.create_annotated_heatmap(
+            z=cm_arr,
+            x=labels,
+            y=labels,
+            annotation_text=[[f"{v:.1f}" for v in row] for row in cm_arr],
+            colorscale="Blues",
+            showscale=True,
+            zmin=0,
+            zmax=100,
+        )
+        fig.update_layout(
+            title=title,
+            xaxis_title="Predicted",
+            yaxis_title="True",
+            font=dict(size=11),
+        )
+        fig.update_xaxes(side="bottom", tickangle=45)
+        self._run.log({f"eval/{title}": fig})
 
     def log_artifact(
         self,
@@ -135,7 +141,6 @@ class WandbHandler:
         metadata: dict[str, Any] | None = None,
         aliases: list[str] | None = None,
     ):
-        """Upload a file as a W&B artifact."""
         if not self._run:
             logger.info(f"[Wandb] Artifact upload skipped (disabled): {name}")
             return
@@ -155,7 +160,6 @@ class WandbHandler:
         logger.info(f"[Wandb] Artifact uploaded: {name} ({artifact_type})")
 
     def finish(self) -> None:
-        """Finish the wandb run."""
         if self._run is not None:
             self._run.finish()
             logger.info("[Wandb] Run finished.")

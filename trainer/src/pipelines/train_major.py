@@ -1,17 +1,12 @@
-"""Training loop for FinBERT (8 L1 classes + 3 sentiment).
+"""Training loop for major (L1) classifier — two-phase BERT fine-tune.
 
-Two-phase training:
-  Phase 1: Freeze BERT backbone, train L1 + Sentiment heads.
-  Phase 2: Unfreeze BERT, fine-tune all params with lower BERT LR.
-
-Usage:
-    python -m trainer.finbert.train
+Phase 1: Freeze BERT backbone, train L1 + Sentiment heads.
+Phase 2: Unfreeze BERT, fine-tune all params with lower BERT LR.
 """
 
 from __future__ import annotations
 
 import json
-import random
 import time
 from datetime import datetime
 from pathlib import Path
@@ -27,24 +22,19 @@ from torch.utils.data import DataLoader
 from transformers import AutoTokenizer
 from transformers.optimization import get_linear_schedule_with_warmup
 
-from trainer.config import get_config
-from trainer.finbert.dataset import (
+from trainer.src.config import get_config
+from trainer.src.datasets.major import (
     IDX_TO_L1,
     L1_TO_IDX,
     SENTIMENT_LABELS,
     NewsClassificationDataset,
     preprocess_split,
 )
-from trainer.finbert.model import FinBERTClassifier, load_finbert_classifier
-from trainer.logger import get_logger
-from trainer.wandb_handler import WandbRegistry
-
-# ─── Helpers ───────────────────────────────────────────────────────────────────
+from trainer.src.models.major import MajorClassifier, load_major_classifier
+from trainer.src.utils import WandbRegistry, get_logger
 
 
 class EvalMetrics:
-    """Evaluation metrics returned by the evaluate() function."""
-
     def __init__(
         self,
         loss: float,
@@ -71,23 +61,11 @@ class EvalMetrics:
         }
 
 
-def set_seed(seed: int) -> None:
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-
-
-# ─── Evaluation ────────────────────────────────────────────────────────────────
-
-
 def evaluate(
     model: torch.nn.Module,
     dataloader: DataLoader,
     device: torch.device,
 ) -> EvalMetrics:
-    """Run evaluation, return loss / accuracy metrics."""
     model.eval()
     total_loss = 0.0
     l1_correct = 0
@@ -130,86 +108,60 @@ def evaluate(
     )
 
 
-# ─── Phase control ───────────────────────────────────────────────────────────────
-
-
-def freeze_bert(model: FinBERTClassifier) -> None:
+def freeze_bert(model: MajorClassifier) -> None:
     for param in model.bert.parameters():
         param.requires_grad = False
-    get_logger().info("[FinBERT] BERT backbone frozen (Phase 1)")
+    get_logger().info("[Major] BERT backbone frozen (Phase 1)")
 
 
-def unfreeze_bert(model: FinBERTClassifier) -> None:
+def unfreeze_bert(model: MajorClassifier) -> None:
     for param in model.bert.parameters():
         param.requires_grad = True
-    get_logger().info("[FinBERT] BERT backbone unfrozen (Phase 2)")
+    get_logger().info("[Major] BERT backbone unfrozen (Phase 2)")
 
 
-# ─── Main training function ───────────────────────────────────────────────────
-
-
-def train_finbert(device: torch.device) -> None:
-    """Train FinBERT on labeled news data.
-
-    Returns dict with path to best checkpoint (or None if save_checkpoint=False).
-    """
+def train_major(device: torch.device) -> None:
     cfg = get_config()
     logger = get_logger()
 
-    logger.info(f"[FinBERT] Device: {device}")
+    logger.info(f"[Major] Device: {device}")
 
-    finbert_cfg = cfg.finbert
-    dcfg = finbert_cfg.data
-    mcfg = finbert_cfg.model
-    tcfg = finbert_cfg.training
+    major_cfg = cfg.major
+    dcfg = major_cfg.data
+    mcfg = major_cfg.model
+    tcfg = major_cfg.training
 
-    # Generate run name early so we can use it for the output directory
-    # (matches WandbHandler's auto-naming convention)
-    run_name = f"finbert-{datetime.now():%m%d-%H%M}"
+    run_name = f"major-{datetime.now():%m%d-%H%M}"
     run_output_dir = (
-        Path(tcfg.output_dir) / run_name if tcfg.output_dir else Path("trainer/checkpoints/finbert") / run_name
+        Path(tcfg.output_dir) / run_name if tcfg.output_dir else Path("trainer/checkpoints/major") / run_name
     )
     run_output_dir.mkdir(parents=True, exist_ok=True)
 
-    wb = WandbRegistry.get("finbert")
+    wb = WandbRegistry.get("major")
 
     tokenizer = AutoTokenizer.from_pretrained(mcfg.pretrained_model)
 
-    assert dcfg.raw_data_dir is not None, "raw_data_dir must be set in config for data preprocessing"
+    assert dcfg.raw_data_dir is not None, "raw_data_dir must be set in config"
 
     preprocess_split(dcfg.raw_data_dir / "raw.parquet", val_ratio=dcfg.val_ratio, seed=cfg.seed)
     train_ds = NewsClassificationDataset(
         dcfg.raw_data_dir / "train.parquet",
         tokenizer,
         max_length=mcfg.max_seq_length,
-        l1_to_idx=L1_TO_IDX,
         use_content=dcfg.use_content,
     )
     val_ds = NewsClassificationDataset(
         dcfg.raw_data_dir / "val.parquet",
         tokenizer,
         max_length=mcfg.max_seq_length,
-        l1_to_idx=L1_TO_IDX,
         use_content=dcfg.use_content,
     )
-    logger.info(f"[FinBERT] Train: {len(train_ds)}, Val: {len(val_ds)}")
+    logger.info(f"[Major] Train: {len(train_ds)}, Val: {len(val_ds)}")
 
-    train_loader = DataLoader(
-        train_ds,
-        batch_size=dcfg.batch_size,
-        shuffle=True,
-        num_workers=4,
-        pin_memory=True,
-    )
-    val_loader = DataLoader(
-        val_ds,
-        batch_size=dcfg.batch_size,
-        shuffle=False,
-        num_workers=4,
-        pin_memory=True,
-    )
+    train_loader = DataLoader(train_ds, batch_size=dcfg.batch_size, shuffle=True, num_workers=4, pin_memory=True)
+    val_loader = DataLoader(val_ds, batch_size=dcfg.batch_size, shuffle=False, num_workers=4, pin_memory=True)
 
-    model = load_finbert_classifier(
+    model = load_major_classifier(
         pretrained_model=mcfg.pretrained_model,
         num_level1=mcfg.num_level1,
         num_sentiment=mcfg.num_sentiment,
@@ -228,7 +180,7 @@ def train_finbert(device: torch.device) -> None:
     epochs_without_improvement = 0
     global_step = 0
 
-    # ── Phase 1: Freeze BERT, train heads ────────────────────────────────────────
+    # Phase 1: Freeze BERT, train heads
     logger.info(f"=== Phase 1: {tcfg.epochs_phase1} epochs with frozen BERT ===")
     freeze_bert(model)
 
@@ -289,7 +241,7 @@ def train_finbert(device: torch.device) -> None:
                 logger.info(
                     f"  [P1 {epoch + 1}] batch= {step + 1}/{len(train_loader)} "
                     f"loss={outputs['loss'].item():.4f} "
-                    f"l1={outputs['l1_loss'].item():.4f} "
+                    f"l1={outputs.get('l1_loss', torch.tensor(0)).item():.4f} "
                     f"sent={outputs.get('sentiment_loss', torch.tensor(0)).item():.4f} "
                     f"lr={lr:.2e}"
                 )
@@ -320,20 +272,19 @@ def train_finbert(device: torch.device) -> None:
                 best_dir = run_output_dir / "best"
                 model.save_pretrained(best_dir)
                 tokenizer.save_pretrained(best_dir)
-                logger.info(f"  ✓ Best saved (l1_acc={best_val_l1_acc:.4f})")
+                logger.info(f"  Best saved (l1_acc={best_val_l1_acc:.4f})")
             else:
-                logger.info(f"  ✓ Best (l1_acc={best_val_l1_acc:.4f}, checkpoint skipped)")
+                logger.info(f"  Best (l1_acc={best_val_l1_acc:.4f}, checkpoint skipped)")
             epochs_without_improvement = 0
         else:
             epochs_without_improvement += 1
-            logger.info(f"  No improvement ({epochs_without_improvement}/{patience})")
             if epochs_without_improvement >= patience:
-                logger.info("[FinBERT] Early stopping triggered in Phase 1. Training stopped.")
+                logger.info("[Major] Early stopping triggered in Phase 1.")
                 break
 
-    # ── Phase 2: Unfreeze BERT, fine-tune all ─────────────────────────────────────
+    # Phase 2: Unfreeze BERT, fine-tune all
     logger.info("=== Phase 2: Unfreezing BERT, training all params ===")
-    epochs_without_improvement = 0  # reset patience counter for Phase 2
+    epochs_without_improvement = 0
     unfreeze_bert(model)
 
     bert_params_decay = []
@@ -402,7 +353,7 @@ def train_finbert(device: torch.device) -> None:
                 logger.info(
                     f"  [P2 {epoch + 1}] batch= {step + 1}/{len(train_loader)} "
                     f"loss={outputs['loss'].item():.4f} "
-                    f"l1={outputs['l1_loss'].item():.4f} "
+                    f"l1={outputs.get('l1_loss', torch.tensor(0)).item():.4f} "
                     f"sent={outputs.get('sentiment_loss', torch.tensor(0)).item():.4f} "
                     f"lr={lr:.2e}"
                 )
@@ -433,18 +384,16 @@ def train_finbert(device: torch.device) -> None:
                 best_dir = run_output_dir / "best"
                 model.save_pretrained(best_dir)
                 tokenizer.save_pretrained(best_dir)
-                logger.info(f"✓ Best saved (l1_acc={best_val_l1_acc:.4f})")
+                logger.info(f"Best saved (l1_acc={best_val_l1_acc:.4f})")
             else:
-                logger.info(f"✓ Best (l1_acc={best_val_l1_acc:.4f}, checkpoint skipped)")
+                logger.info(f"Best (l1_acc={best_val_l1_acc:.4f}, checkpoint skipped)")
             epochs_without_improvement = 0
         else:
             epochs_without_improvement += 1
-            logger.info(f"  No improvement ({epochs_without_improvement}/{patience})")
             if epochs_without_improvement >= patience:
-                logger.info("[FinBERT] Early stopping triggered in Phase 2. Training stopped.")
+                logger.info("[Major] Early stopping triggered in Phase 2.")
                 break
 
-    # ── Save label maps ────────────────────────────────────────────────────────
     label_info = {
         "l1_to_idx": L1_TO_IDX,
         "idx_to_l1": {str(k): v for k, v in IDX_TO_L1.items()},
@@ -460,9 +409,4 @@ def train_finbert(device: torch.device) -> None:
         }
     )
 
-    best_path = run_output_dir / "best" if tcfg.save_checkpoint else None
-    logger.info(f"\n[FinBERT] Training complete. Best val L1 accuracy: {best_val_l1_acc:.4f}")
-    if best_path:
-        logger.info(f"[FinBERT] Best checkpoint: {best_path}")
-    else:
-        logger.info("[FinBERT] Checkpoint saving disabled (save_checkpoint=False)")
+    logger.info(f"\n[Major] Training complete. Best val L1 accuracy: {best_val_l1_acc:.4f}")

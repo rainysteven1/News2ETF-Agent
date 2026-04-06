@@ -1,12 +1,4 @@
-"""Dataset for FinBERT news classification.
-
-Expected parquet columns:
-  - title:          str   -- news headline
-  - content:        str   -- news body (optional)
-  - major_category: str   -- level-1 category label
-  - sentiment:      int or str -- 0/negative, 1/neutral, 2/positive
-"""
-
+"""Major (L1) dataset — news classification for major category + sentiment."""
 from __future__ import annotations
 
 from pathlib import Path
@@ -16,8 +8,6 @@ import torch
 from sklearn.model_selection import train_test_split
 from torch.utils.data import Dataset
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
-
-# ─── Level-1 category names ────────────────────────────────────────────────────
 
 
 L1_CATEGORIES: list[str] = [
@@ -41,9 +31,6 @@ SENTIMENT_STR_TO_INT: dict[str | int, int] = {
 }
 
 SENTIMENT_LABELS: list[str] = ["negative", "neutral", "positive"]
-
-
-# ─── Train/val split ───────────────────────────────────────────────────────────
 
 
 def preprocess_split(
@@ -70,24 +57,19 @@ def preprocess_split(
     val_df.write_parquet(val_path)
 
 
-# ─── Datasets ─────────────────────────────────────────────────────────────────
-
-
 class NewsClassificationDataset(Dataset):
-    """Tokenized news dataset for FinBERT classification (L1 + sentiment)."""
+    """Tokenized news dataset for major category + sentiment classification."""
 
     def __init__(
         self,
         parquet_path: str | Path,
         tokenizer: PreTrainedTokenizerBase,
         max_length: int = 128,
-        l1_to_idx: dict[str, int] | None = None,
         use_content: bool = False,
     ):
         self.tokenizer = tokenizer
         self.max_length = max_length
         self.use_content = use_content
-        self.l1_to_idx = l1_to_idx or L1_TO_IDX
 
         df = pl.read_parquet(parquet_path)
         self._validate(df)
@@ -96,7 +78,7 @@ class NewsClassificationDataset(Dataset):
         self.contents = df["content"].to_list() if use_content and "content" in df.columns else None
 
         raw_l1 = df["major_category"].to_list()
-        self.l1_labels = [self.l1_to_idx[str(v)] for v in raw_l1]
+        self.l1_labels = [L1_TO_IDX[str(v)] for v in raw_l1]
 
         raw_sentiment = df["sentiment"].to_list()
         self.sentiment_labels = [SENTIMENT_STR_TO_INT[s] if isinstance(s, str) else int(s) for s in raw_sentiment]
@@ -138,56 +120,4 @@ class NewsClassificationDataset(Dataset):
             "token_type_ids": token_type_ids,
             "l1_label": torch.tensor(self.l1_labels[idx], dtype=torch.long),
             "sentiment_label": torch.tensor(self.sentiment_labels[idx], dtype=torch.long),
-        }
-
-
-class NewsInferenceDataset(Dataset):
-    """Unlabeled dataset for batch inference."""
-
-    def __init__(
-        self,
-        parquet_path: str | Path,
-        tokenizer: PreTrainedTokenizerBase,
-        max_length: int = 128,
-        use_content: bool = False,
-    ):
-        self.tokenizer = tokenizer
-        self.max_length = max_length
-
-        df = pl.read_parquet(parquet_path)
-        if "title" not in df.columns:
-            raise ValueError("Parquet file must contain a 'title' column")
-
-        self.titles = df["title"].to_list()
-        self.contents = df["content"].to_list() if use_content and "content" in df.columns else None
-        self.meta = df
-
-    def __len__(self) -> int:
-        return len(self.titles)
-
-    def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
-        text = self.titles[idx]
-        if self.contents is not None:
-            content = self.contents[idx]
-            if content is not None and content:
-                text = f"{text}[SEP]{str(content)[:256]}"
-
-        encoding = self.tokenizer(
-            text,
-            max_length=self.max_length,
-            padding="max_length",
-            truncation=True,
-            return_tensors="pt",
-        )
-
-        input_ids = encoding["input_ids"].squeeze(0)
-        attention_mask = encoding["attention_mask"].squeeze(0)
-        token_type_ids = encoding.get("token_type_ids", torch.zeros_like(input_ids))
-        if token_type_ids.dim() > 1:
-            token_type_ids = token_type_ids.squeeze(0)
-
-        return {
-            "input_ids": input_ids,
-            "attention_mask": attention_mask,
-            "token_type_ids": token_type_ids,
         }

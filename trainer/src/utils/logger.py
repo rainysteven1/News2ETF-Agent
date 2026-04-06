@@ -1,7 +1,4 @@
-"""
-Logger management using loguru
-"""
-
+"""Logger management using loguru."""
 import sys
 from pathlib import Path
 
@@ -13,11 +10,8 @@ class TrainerLogger:
         from loguru import logger
 
         self.logger = logger
-
-        # Remove default stderr handler to avoid duplicate console output
         self.logger.remove()
 
-        # File sink
         if log_path is not None:
             self.logger.add(
                 log_path,
@@ -27,8 +21,6 @@ class TrainerLogger:
                 format="{time:YYYY-MM-DD HH:mm:ss} | {level} | {message}",
             )
 
-        # Console sink with colors and time.
-        # Use explicit colorized format to improve visibility in most terminals.
         self.logger.add(
             sys.stderr,
             level="DEBUG",
@@ -47,9 +39,6 @@ class TrainerLogger:
 
     def debug(self, msg: str):
         self.logger.debug(msg)
-
-
-# ── Module-level singleton ───────────────────────────────────────────────────
 
 
 _instance: TrainerLogger | None = None

@@ -343,6 +343,155 @@ Step 4: 将 patterns 注入 Prompt（每 4 周更新一次）
 
 **注意**：日 Guardrail 只做"紧急退出"，不参与正常仓位调整。
 
+---
+
+## 跨行业传导：滞后相关性替代 GNN
+
+**为什么不用 GNN**：
+- GNN 训练极其不稳定，A 股行业联动（如：煤炭→火电→绿电）的逻辑随政策频繁变动
+- 周频/日频样本量有限，GNN 容易过拟合
+
+**替代方案：手动特征交叉（滞后相关性）**
+
+在 LightGBM 输入中，给每个元板块增加 **Global_Leader_Sentiment** 特征：
+
+| 元板块 | 传导信号来源 | 逻辑 |
+|--------|-------------|------|
+| 高端制造 | 有色金属/能源情感 | 上游资源涨价 → 制造成本压力 |
+| 科技成长 | 半导体情感 | 硬件→软件联动，景气度传导 |
+| 大消费 | 医药健康情感 | 防御板块情感对消费有领先性 |
+| 红利/中特估 | 银行情感 | 利率预期传导链 |
+| 金融地产 | 建筑情感 | 基建链前端 |
+| 周期资源 | 石油石化情感 | 全球定价锚定 |
+| 智能网联 | 新能源情感 | 能源转型主线 |
+| 区域经济 | 基建情感 | 政策驱动型传导 |
+
+**计算方式**：
+```python
+# 滞后相关性：取前 5 日的领导板块情感均值作为从属板块的输入
+global_leader_sentiment[sector][t] = mean(sentiment[leader_sector][t-5:t])
+```
+
+**嵌入位置**：LightGBM 输入 X 的新增通道，随 TCN 输出 + 市场状态特征一同输入。
+
+---
+
+## XAI 模块：SHAP 可解释性分析
+
+**目标**：拆解黑盒 LightGBM，增强金融决策透明度
+
+### SHAP 分析流程
+
+```python
+import shap
+
+# LightGBM 训练完成后
+explainer = shap.TreeExplainer(lgbm_model)
+shap_values = explainer.shap_values(X_lgbm_test)  # shape: (n_samples, n_features, n_classes)
+
+# 每周决策时：解释为什么看好/看空某板块
+shap_summary = {
+    "科技成长": {
+        "shap_values": shap_values[week_idx, :, sector_idx],
+        "top_positive_features": ["sentiment_acceleration", "iforest_heat"],
+        "top_negative_features": ["price_momentum_1w", "sentiment_std"]
+    }
+}
+```
+
+### 特征贡献分解
+
+| 特征通道 | SHAP 贡献解读 |
+|---------|--------------|
+| `sentiment_ema` | 情感存量贡献，正向→加仓，负向→减仓 |
+| `sentiment_acceleration` | 爆发点识别，贡献大→趋势加速确认 |
+| `sentiment_std` | 分歧度，高→多空博弈预警 |
+| `sentiment_vs_price_residual` | 预期差，>0→补涨机会，<0→利好出尽 |
+| `global_leader_sentiment` | 跨行业传导贡献，验证逻辑链 |
+| `market_beta` | Beta敏感度，泥沙俱下行情中权重降低 |
+
+### 回测报告嵌入
+
+每期回测报告生成以下 SHAP 可视化：
+
+1. **SHAP Summary Plot**：展示所有特征对 LightGBM 预测的平均绝对贡献
+2. **SHAP Force Plot（每周）**：解释本周决策的核心驱动因素
+3. **SHAP Dependence Plot**：展示 `sentiment_acceleration` 与预测输出的非线性关系
+4. **特征重要性时序图**：展示过去 4 周哪些特征持续贡献Alpha
+
+### 实现步骤
+
+```python
+# Phase 1 末新增
+- [ ] 新建 `trainer/signals/xai.py`：SHAP 分析模块
+  - `compute_shap_values(model, X_test)` → shap_values
+  - `generate_summary_plot(shap_values, X_test, output_path)`
+  - `generate_force_plot(shap_values, X_test, date, output_path)`
+  - `export_shap_values(shap_values, dates)` → CSV for report
+- [ ] 修改 `trainer/signals/train.py`：训练完成后自动运行 SHAP 分析
+- [ ] 修改 `src/backtest/engine.py`：在回测报告中嵌入 SHAP 可视化
+```
+
+**注意**：SHAP 只在 Phase 2/3 决策日志中展示，不参与实际交易决策。
+
+---
+
+## 市场Beta敏感度（Dynamic Beta）
+
+**计算方式**：
+```python
+# 滚动 20 日行业 vs 沪深300（或中证全指）收益率相关性
+market_beta[sector][t] = rolling_correlation(
+    returns[sector][t-20:t],
+    returns[index][t-20:t],
+    window=20
+)
+```
+
+**LightGBM 输入**：每元板块 1 维 Beta 值（标准化后）
+
+**决策逻辑嵌入**：
+| Beta 区间 | 市场状态 | LightGBM 信号权重调整 |
+|-----------|---------|----------------------|
+| < 0.3 | 结构性行情（行业分化） | 信号权重 ×1.0 |
+| 0.3~0.6 | 平衡市场 | 信号权重 ×0.85 |
+| > 0.6 | 泥沙俱下（系统性风险） | 信号权重 ×0.7，触发 Guardrail 降仓提示 |
+
+**为什么需要这个特征**：
+- A 股经常出现"大盘崩了再好的行业逻辑也带不动"的情况
+- Beta 高的行业在 Guardrail 触发前就先对 LightGBM 信号做折扣
+
+---
+
+## 完整 LightGBM 输入特征清单（更新后共16维）
+
+| # | 特征名 | 来源 | 说明 |
+|---|--------|------|------|
+| 1 | `delta_sentiment` | TCN输出 | 8元板块情感变化 |
+| 2 | `news_count` | 新闻聚合 | 8元板块新闻数量 |
+| 3 | `tcn_reg` | TCN回归输出 | 8维动量预测 |
+| 4 | `tcn_cls` | TCN分类输出 | 8维方向预测 |
+| 5 | `volume_ratio` | OHLCV | 量比（当日/均值） |
+| 6 | `intraday_vol` | OHLCV | 日内波动率 |
+| 7 | `iforest_heat` | IForest | 8维热度异常 |
+| 8 | `price_momentum_1w` | 价格 | 近1周动量 |
+| 9 | `price_momentum_4w` | 价格 | 近4周动量 |
+| 10 | `sentiment_std` | 新闻聚合 | 情感分歧度 |
+| 11 | `sentiment_vs_price_residual` | 计算 | 预期差特征 |
+| 12 | `global_leader_sentiment` | 手动特征 | 跨行业传导特征 |
+| 13 | `market_beta` | 价格计算 | Beta敏感度 |
+| 14 | `vol_percentile` | 价格 | 52周波动率分位 |
+| 15 | `sentiment_entropy` | 新闻聚合 | 情感熵 |
+| 16 | `news_dominance_ratio` | 新闻聚合 | 聚光灯效应 |
+
+**注意**：Phase 1 训练 TCN+IForest+LightGBM 时先不上 Beta/Lagged Correlation，等 Phase 2 数据积累后再补充；Phase 1 主要验证 TCN 的跨行业学习能力。
+
+---
+
+## Guardrail 规则（周决策 + 日监控）
+
+### 周一决策时（Weekly Guardrail）
+
 ### Guardrail 优先级覆盖（Critical）
 
 **规则冲突处理原则**：Daily Guardrail 的优先级 **必须高于** Agent Level 1 计划。一旦触发，直到下周一 Agent 重新决策前，该板块标记为 `FORBIDDEN_ZONE`。

@@ -17,8 +17,8 @@ import polars as pl
 from loguru import logger
 from transformers import AutoTokenizer
 
-from trainer.finbert.dataset import L1_CATEGORIES, SENTIMENT_LABELS
-from trainer.setfit_module.model import LabelStats, _safe_name
+from trainer.src.datasets.major import L1_CATEGORIES, SENTIMENT_LABELS
+from trainer.src.config import LabelStats, safe_name
 
 if TYPE_CHECKING:
     from src.config import AgentRootConfig
@@ -88,15 +88,15 @@ class ONNXInferencePipeline:
         if self._setfit_sessions:
             return
 
-        label_stats = LabelStats()
+        label_stats = LabelStats.load()
         majors = label_stats.get_major_categories()
         self._subcats_lookup = {
             **{m: label_stats.get_sub_categories(m) for m in majors},
-            **{_safe_name(k): v for k, v in {m: label_stats.get_sub_categories(m) for m in majors}.items()},
+            **{safe_name(k): v for k, v in {m: label_stats.get_sub_categories(m) for m in majors}.items()},
         }
 
         for m in majors:
-            safe = _safe_name(m)
+            safe = safe_name(m)
             onnx_path = self.setfit_base_dir / safe / "best.onnx"
             tok_path = self.setfit_base_dir / safe / "tokenizer"
             if onnx_path.exists() and tok_path.exists():
@@ -141,7 +141,7 @@ class ONNXInferencePipeline:
         safe_to_texts: dict[str, list[str]] = {}
         safe_to_idx: dict[str, list[int]] = {}
         for i, m in enumerate(majors):
-            safe = _safe_name(m)
+            safe = safe_name(m)
             safe_to_texts.setdefault(safe, []).append(texts[i])
             safe_to_idx.setdefault(safe, []).append(i)
 

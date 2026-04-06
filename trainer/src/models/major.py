@@ -1,40 +1,23 @@
-"""Simplified FinBERT for 8 large categories + 3 sentiment classification.
-
-Architecture:
-  - BERT backbone (shared)
-  - L1 head: mean pooling → 8 classes (major industry category)
-  - Sentiment head: CLS pooled → 3 classes (negative/neutral/positive)
-
-Loss: L = α * CE(L1) + γ * CE(Sentiment)
-"""
-
+"""Major (L1) classifier — BERT backbone + dual heads (major category + sentiment)."""
 from __future__ import annotations
 
 from pathlib import Path
 
 import torch
 import torch.nn as nn
-from loguru import logger
 from transformers.configuration_utils import PretrainedConfig
 from transformers.models.bert.modeling_bert import BertModel, BertPreTrainedModel
 
 
 def mean_pooling(hidden_states: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
-    """Mean pool over non-padded tokens."""
     mask_expanded = attention_mask.unsqueeze(-1).expand(hidden_states.size()).float()
     sum_embeddings = torch.sum(hidden_states * mask_expanded, dim=1)
     sum_mask = mask_expanded.sum(dim=1).clamp(min=1e-9)
     return sum_embeddings / sum_mask
 
 
-class FinBERTClassifierConfig(PretrainedConfig):
-    """Configuration for simplified FinBERT classifier.
-
-    Inherits all BERT attributes from PretrainedConfig so that BertModel
-    (which accesses config.position_embedding_type etc.) initializes correctly.
-    """
-
-    model_type = "finbert_classifier"
+class MajorClassifierConfig(PretrainedConfig):
+    model_type = "major_classifier"
 
     def __init__(
         self,
@@ -43,7 +26,6 @@ class FinBERTClassifierConfig(PretrainedConfig):
         classifier_dropout: float = 0.1,
         alpha: float = 0.1,
         gamma: float = 0.1,
-        # BERT attributes (populated by from_pretrained via kwargs)
         hidden_size: int = 768,
         num_hidden_layers: int = 12,
         num_attention_heads: int = 12,
@@ -72,12 +54,12 @@ class FinBERTClassifierConfig(PretrainedConfig):
         self.gamma = gamma
 
 
-class FinBERTClassifier(BertPreTrainedModel):
-    """BERT backbone + dual classification heads (L1 category + sentiment)."""
+class MajorClassifier(BertPreTrainedModel):
+    """BERT backbone + dual classification heads (major category + sentiment)."""
 
-    config_class = FinBERTClassifierConfig
+    config_class = MajorClassifierConfig
 
-    def __init__(self, config: FinBERTClassifierConfig):
+    def __init__(self, config: MajorClassifierConfig):
         super().__init__(config)
         self.bert = BertModel(config, add_pooling_layer=True)
         hidden = config.hidden_size
@@ -159,16 +141,15 @@ class FinBERTClassifier(BertPreTrainedModel):
         return result
 
 
-def load_finbert_classifier(
+def load_major_classifier(
     pretrained_model: str,
     num_level1: int = 8,
     num_sentiment: int = 3,
     dropout: float = 0.1,
     alpha: float = 0.1,
     gamma: float = 0.1,
-) -> FinBERTClassifier:
-    """Initialize FinBERT classifier from a pretrained BERT checkpoint."""
-    config = FinBERTClassifierConfig.from_pretrained(
+) -> MajorClassifier:
+    config = MajorClassifierConfig.from_pretrained(
         pretrained_model,
         num_level1=num_level1,
         num_sentiment=num_sentiment,
@@ -176,7 +157,7 @@ def load_finbert_classifier(
         alpha=alpha,
         gamma=gamma,
     )
-    model = FinBERTClassifier.from_pretrained(
+    model = MajorClassifier.from_pretrained(
         pretrained_model,
         config=config,
         ignore_mismatched_sizes=True,
@@ -184,52 +165,43 @@ def load_finbert_classifier(
     return model  # type: ignore
 
 
-def export_finbert_to_onnx(
+def export_major_to_onnx(
     model_dir: Path,
     onnx_path: Path,
     max_seq_length: int = 128,
     opset_version: int = 14,
 ) -> None:
-    """Export a FinBERT model to ONNX format.
+    """Export a Major model to ONNX format."""
+    from trainer.src.utils import get_logger
 
-    The exported model takes tokenized text input (input_ids, attention_mask, token_type_ids)
-    and outputs l1_logits and sentiment_logits.
+    logger = get_logger()
 
-    If ONNX export fails, a warning is logged and no exception is raised (pth checkpoint
-    is assumed to have already been saved by the caller).
-    """
     try:
-        # 1. Load model and force to CPU
-        model = FinBERTClassifier.from_pretrained(str(model_dir))
+        model = MajorClassifier.from_pretrained(str(model_dir))
         model.to("cpu")
         model.eval()
 
-        # 2. Build ONNX-compatible wrapper (inline, no external class needed)
-        class OnnxFinBERTWrapper(torch.nn.Module):
-            def __init__(self, finbert_model: FinBERTClassifier):
+        class OnnxWrapper(torch.nn.Module):
+            def __init__(self, m: MajorClassifier):
                 super().__init__()
-                self.bert = finbert_model.bert
-                self.dropout = finbert_model.dropout
-                self.l1_fc1 = finbert_model.l1_fc1
-                self.l1_activation = finbert_model.l1_activation
-                self.l1_dropout = finbert_model.l1_dropout
-                self.l1_fc2 = finbert_model.l1_fc2
-                self.sent_fc1 = finbert_model.sent_fc1
-                self.sent_activation = finbert_model.sent_activation
-                self.sent_dropout = finbert_model.sent_dropout
-                self.sent_fc2 = finbert_model.sent_fc2
+                self.bert = m.bert
+                self.dropout = m.dropout
+                self.l1_fc1 = m.l1_fc1
+                self.l1_activation = m.l1_activation
+                self.l1_dropout = m.l1_dropout
+                self.l1_fc2 = m.l1_fc2
+                self.sent_fc1 = m.sent_fc1
+                self.sent_activation = m.sent_activation
+                self.sent_dropout = m.sent_dropout
+                self.sent_fc2 = m.sent_fc2
 
             def forward(
                 self,
                 input_ids: torch.Tensor,
                 attention_mask: torch.Tensor,
                 token_type_ids: torch.Tensor,
-            ) -> dict[str, torch.Tensor]:
-                outputs = self.bert(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    token_type_ids=token_type_ids,
-                )
+            ):
+                outputs = self.bert(input_ids=input_ids, attention_mask=attention_mask, token_type_ids=token_type_ids)
                 pooled = self.dropout(outputs.pooler_output)
                 mask_expanded = attention_mask.unsqueeze(-1).expand(outputs.last_hidden_state.size()).float()
                 sum_embeddings = torch.sum(outputs.last_hidden_state * mask_expanded, dim=1)
@@ -244,14 +216,12 @@ def export_finbert_to_onnx(
                 sent_logits = self.sent_fc2(sent_hidden)
                 return {"logits": l1_logits, "sentiment_logits": sent_logits}
 
-        wrapper = OnnxFinBERTWrapper(model)
+        wrapper = OnnxWrapper(model)
 
-        # 3. Prepare dummy inputs
         dummy_input_ids = torch.ones(1, max_seq_length, dtype=torch.long)
         dummy_attention_mask = torch.ones(1, max_seq_length, dtype=torch.long)
         dummy_token_type_ids = torch.zeros(1, max_seq_length, dtype=torch.long)
 
-        # 4. Export
         onnx_path.parent.mkdir(parents=True, exist_ok=True)
 
         torch.onnx.export(
@@ -272,7 +242,6 @@ def export_finbert_to_onnx(
             },
         )
 
-        # 5. Save tokenizer alongside
         from transformers import AutoTokenizer
 
         tokenizer = AutoTokenizer.from_pretrained(model.config._name_or_path)
@@ -280,7 +249,7 @@ def export_finbert_to_onnx(
         tokenizer_dir.mkdir(exist_ok=True, parents=True)
         tokenizer.save_pretrained(tokenizer_dir)
 
-        logger.info(f"[ONNX] Exported FinBERT to {onnx_path}")
+        logger.info(f"[ONNX] Exported Major to {onnx_path}")
 
     except Exception as exc:
         logger.warning(f"[ONNX] Export failed ({exc}), pth checkpoint saved for manual conversion")

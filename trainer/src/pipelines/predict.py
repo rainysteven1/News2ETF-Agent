@@ -1,11 +1,8 @@
-"""Batch inference: FinBERT (major+sentiment) + SetFit (sub-category) ONNX.
+"""Batch inference: Major (FinBERT) + Sub (SetFit) ONNX pipeline.
 
-All configuration is read from config.toml — no CLI arguments.
-
-Phase 1: FinBERT → intermediate parquet (major_category, sentiment, confidences)
-Phase 2: SetFit sub-category → final output parquet
+Phase 1: Major → intermediate parquet (major_category, sentiment, confidences)
+Phase 2: Sub-category (SetFit) → final output parquet
 """
-
 from __future__ import annotations
 
 import os
@@ -19,11 +16,8 @@ import polars as pl
 from loguru import logger
 from transformers import AutoTokenizer
 
-from trainer.finbert.dataset import L1_CATEGORIES, SENTIMENT_LABELS
-from trainer.config import LabelStats
-from trainer.setfit_module.model import _safe_name
-
-# ─── ONNX Helpers ────────────────────────────────────────────────────────────────
+from trainer.src.config import LabelStats, load_config, safe_name
+from trainer.src.datasets.major import L1_CATEGORIES, SENTIMENT_LABELS
 
 
 def _make_ort_session(
@@ -51,35 +45,29 @@ def _tokenize(texts: list[str], tokenizer: AutoTokenizer, max_length: int) -> di
         truncation=True,
         max_length=max_length,
         return_tensors="np",
-    )  # type: ignore
+    )
     return {
         "input_ids": inputs["input_ids"],
         "attention_mask": inputs["attention_mask"],
     }
 
 
-def _run_finbert_from_inputs(
+def _run_major_from_inputs(
     sess: ort.InferenceSession,
     inputs: dict[str, np.ndarray],
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Run FinBERT from pre-tokenized inputs; returns (l1_logits, sent_logits)."""
     onnx_inputs = {
         "input_ids": inputs["input_ids"].astype(np.int64),
         "attention_mask": inputs["attention_mask"].astype(np.int64),
         "token_type_ids": np.zeros_like(inputs["input_ids"]).astype(np.int64),
     }
-    return sess.run(None, onnx_inputs)  # type: ignore[return-value]
-
-
-# ─── Phase 1: FinBERT ───────────────────────────────────────────────────────────
+    return sess.run(None, onnx_inputs)
 
 
 def run_finbert(limit_rows: int | None = None) -> Path | None:
-    """Run FinBERT inference; saves intermediate parquet and returns its path."""
-    from trainer.config import load_config
-
+    """Run Major (FinBERT) inference; saves intermediate parquet and returns its path."""
     cfg = load_config()
-    p = cfg.predict
+    p = cfg.prediction
 
     input_path = p.input_path
     finbert_output_path = p.finbert_output_path
@@ -92,7 +80,7 @@ def run_finbert(limit_rows: int | None = None) -> Path | None:
         "input_path and finbert_output_path must be set in config.toml"
     )
 
-    logger.info(f"[FinBERT] Loading raw data: {input_path}")
+    logger.info(f"[Major] Loading raw data: {input_path}")
     df_raw = pl.read_parquet(input_path)
 
     required_cols = {"datetime", "title", "content"}
@@ -102,12 +90,8 @@ def run_finbert(limit_rows: int | None = None) -> Path | None:
 
     both_empty = df_raw.filter(pl.col("title").is_null() & pl.col("content").is_null()).height
     if both_empty > 0:
-        logger.info(f"[FinBERT] Skipping {both_empty} rows with both title and content null")
+        logger.info(f"[Major] Skipping {both_empty} rows with both title and content null")
         df_raw = df_raw.filter(~(pl.col("title").is_null() & pl.col("content").is_null()))
-
-    null_title_valid_content = df_raw.filter(pl.col("title").is_null() & pl.col("content").is_not_null()).height
-    if null_title_valid_content > 0:
-        logger.info(f"[FinBERT] {null_title_valid_content} rows have null title (will use content)")
 
     if len(df_raw) == 0:
         raise ValueError("No valid rows to process")
@@ -118,28 +102,26 @@ def run_finbert(limit_rows: int | None = None) -> Path | None:
         df_raw = df_raw.head(limit_rows)
 
     n = len(df_raw)
-    logger.info(f"[FinBERT] {n} valid rows to process")
+    logger.info(f"[Major] {n} valid rows to process")
 
-    # ── Load FinBERT ONNX ────────────────────────────────────────────────────
     cpu_count = os.cpu_count() or 1
     intra_threads = 1
     inter_threads = max(1, cpu_count // 8)
-    logger.info(f"[FinBERT] CPU cores={cpu_count}, ORT threads: intra={intra_threads}, inter={inter_threads}")
+    logger.info(f"[Major] CPU cores={cpu_count}, ORT threads: intra={intra_threads}, inter={inter_threads}")
 
     assert finbert_onnx_dir is not None, "FinBERT ONNX directory must be set in config.toml"
     finbert_onnx_path = finbert_onnx_dir / "best.onnx"
     finbert_tokenizer_path = finbert_onnx_dir / "tokenizer"
 
     if not finbert_onnx_path.exists():
-        raise FileNotFoundError(f"FinBERT ONNX not found: {finbert_onnx_path}")
+        raise FileNotFoundError(f"Major ONNX not found: {finbert_onnx_path}")
     if not finbert_tokenizer_path.exists():
-        raise FileNotFoundError(f"FinBERT tokenizer not found: {finbert_tokenizer_path}")
+        raise FileNotFoundError(f"Major tokenizer not found: {finbert_tokenizer_path}")
 
-    logger.info(f"[FinBERT] Loading FinBERT ONNX: {finbert_onnx_path}")
+    logger.info(f"[Major] Loading Major ONNX: {finbert_onnx_path}")
     finbert_sess = _make_ort_session(finbert_onnx_path, intra_threads, inter_threads)
     finbert_tokenizer = AutoTokenizer.from_pretrained(str(finbert_tokenizer_path))
 
-    # ── Pre-compute texts ────────────────────────────────────────────────────
     texts_for_finbert: list[str | None] = []
     for row in df_raw.iter_rows(named=True):
         title, content = row["title"], row["content"]
@@ -150,9 +132,8 @@ def run_finbert(limit_rows: int | None = None) -> Path | None:
         else:
             texts_for_finbert.append(None)
 
-    # ── Pre-tokenize all batches ────────────────────────────────────────────
     total_batches = (n + batch_size - 1) // batch_size
-    logger.info(f"[FinBERT] {n} rows, {total_batches} batches...")
+    logger.info(f"[Major] {n} rows, {total_batches} batches...")
     t0 = time.monotonic()
 
     finbert_inputs_all: list[dict[str, np.ndarray]] = []
@@ -160,7 +141,6 @@ def run_finbert(limit_rows: int | None = None) -> Path | None:
         batch_replaced = ["" if t is None else t for t in texts_for_finbert[i : i + batch_size]]
         finbert_inputs_all.append(_tokenize(batch_replaced, finbert_tokenizer, finbert_max_length))
 
-    # ── Run FinBERT batch-by-batch ────────────────────────────────────────────
     majors_out = np.empty(n, dtype=object)
     sents_out = np.empty(n, dtype=object)
     l1_confs_out = np.empty(n, dtype=np.float64)
@@ -170,7 +150,7 @@ def run_finbert(limit_rows: int | None = None) -> Path | None:
         futures = []
         for batch_idx in range(total_batches):
             futures.append(
-                (batch_idx, executor.submit(_run_finbert_from_inputs, finbert_sess, finbert_inputs_all[batch_idx]))
+                (batch_idx, executor.submit(_run_major_from_inputs, finbert_sess, finbert_inputs_all[batch_idx]))
             )
 
         for batch_idx, fb_future in futures:
@@ -197,10 +177,9 @@ def run_finbert(limit_rows: int | None = None) -> Path | None:
 
             elapsed = time.monotonic() - t0
             logger.info(
-                f"  Batch {batch_idx + 1}/{total_batches} | FinBERT rows {start}-{end}/{n} | {elapsed:.1f}s total"
+                f"  Batch {batch_idx + 1}/{total_batches} | Major rows {start}-{end}/{n} | {elapsed:.1f}s total"
             )
 
-    # ── Save intermediate ───────────────────────────────────────────────────
     result_df = df_raw.with_columns(
         pl.Series("major_category", majors_out),
         pl.Series("sentiment", sents_out),
@@ -210,19 +189,14 @@ def run_finbert(limit_rows: int | None = None) -> Path | None:
 
     finbert_output_path.parent.mkdir(parents=True, exist_ok=True)
     result_df.write_parquet(finbert_output_path)
-    logger.success(f"[FinBERT] Done → {finbert_output_path}")
+    logger.success(f"[Major] Done → {finbert_output_path}")
     return finbert_output_path
 
 
-# ─── Phase 2: SetFit sub-category ──────────────────────────────────────────────
-
-
 def run_setfit(limit_rows: int | None = None) -> None:
-    """Run SetFit sub-category classification on FinBERT intermediate output."""
-    from trainer.config import load_config
-
+    """Run SetFit sub-category classification on Major intermediate output."""
     cfg = load_config()
-    p = cfg.predict
+    p = cfg.prediction
 
     output_path = p.output_path
     finbert_output_path = p.finbert_output_path
@@ -233,13 +207,13 @@ def run_setfit(limit_rows: int | None = None) -> None:
     if intermediate_path is None:
         assert output_path is not None, "output_path must be set in config.toml"
         intermediate_path = (
-            Path(output_path).parent / f"{Path(output_path).stem}_finbert_only{Path(output_path).suffix}"
+            Path(output_path).parent / f"{Path(output_path).stem}_major_only{Path(output_path).suffix}"
         )
 
     if not intermediate_path.exists():
-        raise FileNotFoundError(f"Intermediate FinBERT result not found: {intermediate_path}")
+        raise FileNotFoundError(f"Intermediate Major result not found: {intermediate_path}")
 
-    logger.info(f"[SetFit] Loading FinBERT intermediate: {intermediate_path}")
+    logger.info(f"[SetFit] Loading Major intermediate: {intermediate_path}")
     df = pl.read_parquet(intermediate_path)
 
     if limit_rows is not None:
@@ -248,13 +222,12 @@ def run_setfit(limit_rows: int | None = None) -> None:
     n = len(df)
     logger.info(f"[SetFit] {n} rows to classify")
 
-    # ── Load SetFit ONNX per major ───────────────────────────────────────────
     cpu_count = os.cpu_count() or 1
     intra_threads = 1
     inter_threads = max(1, cpu_count // 8)
     logger.info(f"[SetFit] CPU cores={cpu_count}, ORT threads: intra={intra_threads}, inter={inter_threads}")
 
-    label_stats = LabelStats()
+    label_stats = LabelStats.load()
     major_categories = label_stats.get_major_categories()
     major_to_subcats: dict[str, list[str]] = {m: label_stats.get_sub_categories(m) for m in major_categories}
 
@@ -264,7 +237,7 @@ def run_setfit(limit_rows: int | None = None) -> None:
     assert setfit_base_dir is not None, "SetFit base directory must be set in config.toml"
 
     for m in major_categories:
-        safe = _safe_name(m)
+        safe = safe_name(m)
         major_dir = setfit_base_dir / safe
         onnx_path = major_dir / "best.onnx"
         tokenizer_path = major_dir / "tokenizer"
@@ -282,10 +255,9 @@ def run_setfit(limit_rows: int | None = None) -> None:
 
     subcats_lookup = {
         **{k: v for k, v in major_to_subcats.items()},
-        **{_safe_name(k): v for k, v in major_to_subcats.items()},
+        **{safe_name(k): v for k, v in major_to_subcats.items()},
     }
 
-    # ── Prepare texts ───────────────────────────────────────────────────────
     texts_for_setfit: list[str | None] = []
     for row in df.iter_rows(named=True):
         title, content = row["title"], row["content"]
@@ -296,13 +268,12 @@ def run_setfit(limit_rows: int | None = None) -> None:
         else:
             texts_for_setfit.append(None)
 
-    # ── Group by safe major ──────────────────────────────────────────────────
     safe_to_global_idx: dict[str, list[int]] = {}
     safe_to_texts: dict[str, list[str]] = {}
 
     for i, row in df.iter_rows(named=True):
         major = row["major_category"]
-        safe = _safe_name(major)
+        safe = safe_name(major)
         if safe not in safe_to_global_idx:
             safe_to_global_idx[safe] = []
             safe_to_texts[safe] = []
@@ -310,7 +281,6 @@ def run_setfit(limit_rows: int | None = None) -> None:
         t = texts_for_setfit[i]
         safe_to_texts[safe].append("" if t is None else t)
 
-    # ── Classify per major ───────────────────────────────────────────────────
     sub_cats_out = np.full(n, "其他", dtype=object)
     sub_confs_out = np.zeros(n, dtype=np.float64)
 
@@ -357,23 +327,20 @@ def run_setfit(limit_rows: int | None = None) -> None:
             elapsed = time.monotonic() - t0
             logger.info(f"  SetFit {safe_major}: {len(results)} rows | {elapsed:.1f}s total")
 
-    # ── Save final output ────────────────────────────────────────────────────
     result_df = df.with_columns(
         pl.Series("sub_category", sub_cats_out),
         pl.Series("sub_category_confidence", sub_confs_out),
     ).sort("datetime")
 
+    assert output_path is not None
     output_path.parent.mkdir(parents=True, exist_ok=True)
     result_df.write_parquet(output_path)
     logger.success(f"[SetFit] Complete output → {output_path}")
 
 
-# ─── Main ───────────────────────────────────────────────────────────────────────
-
-
 def run(limit_rows: int | None = None) -> None:
-    """Run full pipeline: FinBERT → SetFit."""
-    logger.info("[Predict] === Phase 1: FinBERT ===")
+    """Run full pipeline: Major → SetFit."""
+    logger.info("[Predict] === Phase 1: Major ===")
     run_finbert(limit_rows=limit_rows)
 
     logger.info("[Predict] === Phase 2: SetFit sub-category ===")

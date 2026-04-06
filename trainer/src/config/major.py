@@ -1,5 +1,4 @@
-"""FinBERT model and training configuration."""
-
+"""Major (L1) model and training configuration — Level1 major category + sentiment."""
 from __future__ import annotations
 
 from pathlib import Path
@@ -8,8 +7,7 @@ from typing import Any
 from pydantic import BaseModel
 
 
-# ─── Data ───────────────────────────────────────────────────────────────────
-class FinBERTDataConfig(BaseModel):
+class MajorDataConfig(BaseModel):
     raw_data_dir: Path | None = None
     batch_size: int = 32
     use_content: bool = False
@@ -23,10 +21,7 @@ class FinBERTDataConfig(BaseModel):
         }
 
 
-# ─── Model ───────────────────────────────────────────────────────────────────
-
-
-class FinBERTModelConfig(BaseModel):
+class MajorModelConfig(BaseModel):
     pretrained_model: str = "bert-base-chinese"
     num_level1: int = 8
     num_sentiment: int = 3
@@ -43,10 +38,7 @@ class FinBERTModelConfig(BaseModel):
         }
 
 
-# ─── Training ─────────────────────────────────────────────────────────────────
-
-
-class FinBERTTrainingConfig(BaseModel):
+class MajorTrainingConfig(BaseModel):
     output_dir: Path | None = None
     early_stopping_patience: int = 1
     epochs_phase1: int = 3
@@ -76,10 +68,10 @@ class FinBERTTrainingConfig(BaseModel):
         }
 
 
-class FinBERTConfig(BaseModel):
-    data: FinBERTDataConfig = FinBERTDataConfig()
-    model: FinBERTModelConfig = FinBERTModelConfig()
-    training: FinBERTTrainingConfig = FinBERTTrainingConfig()
+class MajorConfig(BaseModel):
+    data: MajorDataConfig = MajorDataConfig()
+    model: MajorModelConfig = MajorModelConfig()
+    training: MajorTrainingConfig = MajorTrainingConfig()
 
     def to_wandb(self) -> dict[str, Any]:
         return {

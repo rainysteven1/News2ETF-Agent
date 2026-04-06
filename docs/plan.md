@@ -374,6 +374,146 @@ Step 4: 将 patterns 注入 Prompt（每 4 周更新一次）
 
 ---
 
+## 跨行业传导：滞后相关性替代 GNN
+
+**为什么不用 GNN**：
+- GNN 训练极其不稳定，A 股行业联动（如：煤炭→火电→绿电）的逻辑随政策频繁变动
+- 周频/日频样本量有限，GNN 容易过拟合
+
+**替代方案：手动特征交叉（滞后相关性）**
+
+在 LightGBM 输入中，给每个元板块增加 **Global_Leader_Sentiment** 特征：
+
+| 元板块 | 传导信号来源 | 逻辑 |
+|--------|-------------|------|
+| 高端制造 | 有色金属/能源情感 | 上游资源涨价 → 制造成本压力 |
+| 科技成长 | 半导体情感 | 硬件→软件联动，景气度传导 |
+| 大消费 | 医药健康情感 | 防御板块情感对消费有领先性 |
+| 红利/中特估 | 银行情感 | 利率预期传导链 |
+| 金融地产 | 建筑情感 | 基建链前端 |
+| 周期资源 | 石油石化情感 | 全球定价锚定 |
+| 智能网联 | 新能源情感 | 能源转型主线 |
+| 区域经济 | 基建情感 | 政策驱动型传导 |
+
+**计算方式**：
+```python
+# 滞后相关性：取前 5 日的领导板块情感均值作为从属板块的输入
+global_leader_sentiment[sector][t] = mean(sentiment[leader_sector][t-5:t])
+```
+
+**嵌入位置**：LightGBM 输入 X 的新增通道，随 TCN 输出 + 市场状态特征一同输入。
+
+---
+
+## 市场Beta敏感度（Dynamic Beta）
+
+**计算方式**：
+```python
+# 滚动 20 日行业 vs 沪深300（或中证全指）收益率相关性
+market_beta[sector][t] = rolling_correlation(
+    returns[sector][t-20:t],
+    returns[index][t-20:t],
+    window=20
+)
+```
+
+**LightGBM 输入**：每元板块 1 维 Beta 值（标准化后）
+
+**决策逻辑嵌入**：
+| Beta 区间 | 市场状态 | LightGBM 信号权重调整 |
+|-----------|---------|----------------------|
+| < 0.3 | 结构性行情（行业分化） | 信号权重 ×1.0 |
+| 0.3~0.6 | 平衡市场 | 信号权重 ×0.85 |
+| > 0.6 | 泥沙俱下（系统性风险） | 信号权重 ×0.7，触发 Guardrail 降仓提示 |
+
+**为什么需要这个特征**：
+- A 股经常出现"大盘崩了再好的行业逻辑也带不动"的情况
+- Beta 高的行业在 Guardrail 触发前就先对 LightGBM 信号做折扣
+
+---
+
+## 完整 LightGBM 输入特征清单（更新后共16维）
+
+| # | 特征名 | 来源 | 说明 |
+|---|--------|------|------|
+| 1 | `delta_sentiment` | TCN输出 | 8元板块情感变化 |
+| 2 | `news_count` | 新闻聚合 | 8元板块新闻数量 |
+| 3 | `tcn_reg` | TCN回归输出 | 8维动量预测 |
+| 4 | `tcn_cls` | TCN分类输出 | 8维方向预测 |
+| 5 | `volume_ratio` | OHLCV | 量比（当日/均值） |
+| 6 | `intraday_vol` | OHLCV | 日内波动率 |
+| 7 | `iforest_heat` | IForest | 8维热度异常 |
+| 8 | `price_momentum_1w` | 价格 | 近1周动量 |
+| 9 | `price_momentum_4w` | 价格 | 近4周动量 |
+| 10 | `sentiment_std` | 新闻聚合 | 情感分歧度 |
+| 11 | `sentiment_vs_price_residual` | 计算 | 预期差特征 |
+| 12 | `global_leader_sentiment` | 手动特征 | 跨行业传导特征 |
+| 13 | `market_beta` | 价格计算 | Beta敏感度 |
+| 14 | `vol_percentile` | 价格 | 52周波动率分位 |
+| 15 | `sentiment_entropy` | 新闻聚合 | 情感熵 |
+| 16 | `news_dominance_ratio` | 新闻聚合 | 聚光灯效应 |
+
+---
+
+## XAI 模块：SHAP 可解释性分析
+
+**目标**：拆解黑盒 LightGBM，增强金融决策透明度
+
+### SHAP 分析流程
+
+```python
+import shap
+
+# LightGBM 训练完成后
+explainer = shap.TreeExplainer(lgbm_model)
+shap_values = explainer.shap_values(X_lgbm_test)  # shape: (n_samples, n_features, n_classes)
+
+# 每周决策时：解释为什么看好/看空某板块
+shap_summary = {
+    "科技成长": {
+        "shap_values": shap_values[week_idx, :, sector_idx],
+        "top_positive_features": ["sentiment_acceleration", "iforest_heat"],
+        "top_negative_features": ["price_momentum_1w", "sentiment_std"]
+    }
+}
+```
+
+### 特征贡献分解
+
+| 特征通道 | SHAP 贡献解读 |
+|---------|--------------|
+| `sentiment_ema` | 情感存量贡献，正向→加仓，负向→减仓 |
+| `sentiment_acceleration` | 爆发点识别，贡献大→趋势加速确认 |
+| `sentiment_std` | 分歧度，高→多空博弈预警 |
+| `sentiment_vs_price_residual` | 预期差，>0→补涨机会，<0→利好出尽 |
+| `global_leader_sentiment` | 跨行业传导贡献，验证逻辑链 |
+| `market_beta` | Beta敏感度，泥沙俱下行情中权重降低 |
+
+### 回测报告嵌入
+
+每期回测报告生成以下 SHAP 可视化：
+
+1. **SHAP Summary Plot**：展示所有特征对 LightGBM 预测的平均绝对贡献
+2. **SHAP Force Plot（每周）**：解释本周决策的核心驱动因素
+3. **SHAP Dependence Plot**：展示 `sentiment_acceleration` 与预测输出的非线性关系
+4. **特征重要性时序图**：展示过去 4 周哪些特征持续贡献Alpha
+
+### 实现步骤
+
+```
+- [ ] 新建 `trainer/signals/xai.py`：SHAP 分析模块
+  - `compute_shap_values(model, X_test)` → shap_values
+  - `generate_summary_plot(shap_values, X_test, output_path)`
+  - `generate_force_plot(shap_values, X_test, date, output_path)`
+  - `export_shap_values(shap_values, dates)` → CSV for report
+- [ ] 修改 `trainer/signals/train.py`：训练完成后自动运行 SHAP 分析
+- [ ] 修改回测报告生成逻辑：嵌入 SHAP 可视化图表
+```
+
+**注意**：SHAP 只在 Phase 2/3 决策日志中展示，不参与实际交易决策。
+
+---
+
 ## 数据规格
 
 ### Phase 1 输出（已有）
@@ -495,7 +635,10 @@ momentum = clip((meta_sentiment[t+5] - meta_sentiment[t]) / (|meta_sentiment[t]|
   - **新增 `export_phase2_dataset()`**：导出每日特征用于 Agent 训练
 - [ ] 训练 TCN（47 → 8 维，学习跨行业传导）
 - [ ] 训练 IForest + LightGBM
-- [ ] ONNX 导出
+- [ ] 新增 `global_leader_sentiment` 跨行业传导特征（滞后相关性）
+- [ ] 新增 `market_beta` Beta敏感度特征（滚动20日相关性）
+- [ ] 新建 `trainer/signals/xai.py`：SHAP 分析模块（训练完成后自动运行）
+- [ ] ONNX 导出（TCN + IForest + LightGBM）
 
 ### Phase 2: Agent 训练系统
 - [ ] 新建 `src/agent/features.py`：`build_agent_features()` 构建 A/B/C/D/E 五类特征
@@ -522,13 +665,14 @@ momentum = clip((meta_sentiment[t+5] - meta_sentiment[t]) / (|meta_sentiment[t]|
 |------|------|
 | `data/meta_sector_mapping.json` | **新建**：47 细分 → 8 元板块 + 权重 |
 | `trainer/signals/dataset.py` | 重构 TCN 数据集（47 维输入，8 维输出，6 通道）；**新增 `export_phase2_dataset()`** |
+| `trainer/signals/xai.py` | **新建**：SHAP 分析模块（TreeExplainer、Summary/Force/Dependence Plot） |
 | `src/agent/features.py` | **新建**：`build_agent_features()` 构建 A/B/C/D/E 五类特征 |
-| `src/agent/decision_logger.py` | **新建**：记录每周决策 + 实际收益 + Guardrail 事件 |
-| `src/agent/daily_guardrail.py` | **新建**：日频紧急退出监控逻辑 |
+| `src/agent/decision_logger.py` | **新建**：记录每周决策 + 实际收益 + Guardrail 事件 + TCN_Prediction_Error |
+| `src/agent/daily_guardrail.py` | **新建**：日频紧急退出监控逻辑 + FORBIDDEN_ZONE 状态机 |
 | `src/agent/tools.py` | 新增 `build_decision_context`（调用 `features.py`）|
 | `src/agent/single_agent.py` | 重构 `decide_node`：改为**每周一决策**模式 |
 | `src/agent/rule_engine.py` | 新建 Guardrail 规则引擎（周决策 + 日监控双模式）|
-| `src/agent/state.py` | `TradeDecision` 支持 `level1_plan`, `level2_plan` |
+| `src/agent/state.py` | `TradeDecision` 支持 `level1_plan`, `level2_plan`；新增 `SectorStatus` 枚举 |
 | `config/prompts/trader.md` | 更新 Prompt（加入 good/bad patterns，动态 Few-shot，周决策模式）|
 
 ---
@@ -562,3 +706,8 @@ momentum = clip((meta_sentiment[t+5] - meta_sentiment[t]) / (|meta_sentiment[t]|
 ### 指标 6：Agent 冷启动验证
 - Phase 2 首 2 周 warm-up 期的决策分布
 - 预期：warm-up 期决策较保守（低权重、高 HOLD 比例）
+
+### 指标 7：XAI 可解释性验证
+- SHAP Summary Plot 特征重要性是否稳定（Top 3 特征不剧烈波动）
+- 每周 Force Plot 决策逻辑是否与 Prompt 决策清单一致
+- 预期：SHAP 贡献度 Top 特征与人工逻辑判断的准确率 > 70%
