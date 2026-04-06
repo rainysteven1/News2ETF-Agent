@@ -501,12 +501,12 @@ shap_summary = {
 ### 实现步骤
 
 ```
-- [ ] 新建 `trainer/signals/xai.py`：SHAP 分析模块
+- [ ] 新建 `trainer/src/utils/signals_xai.py`：SHAP 分析模块
   - `compute_shap_values(model, X_test)` → shap_values
   - `generate_summary_plot(shap_values, X_test, output_path)`
   - `generate_force_plot(shap_values, X_test, date, output_path)`
   - `export_shap_values(shap_values, dates)` → CSV for report
-- [ ] 修改 `trainer/signals/train.py`：训练完成后自动运行 SHAP 分析
+- [ ] 修改 `trainer/src/pipelines/train_signals.py`：训练完成后自动运行 SHAP 分析
 - [ ] 修改回测报告生成逻辑：嵌入 SHAP 可视化图表
 ```
 
@@ -629,7 +629,7 @@ momentum = clip((meta_sentiment[t+5] - meta_sentiment[t]) / (|meta_sentiment[t]|
 ### Phase 1: 模型训练基础设施
 - [x] `data/industry_dict.json`（已存在）
 - [ ] 新建 `data/meta_sector_mapping.json`（47 细分 → 8 元板块 + 权重）
-- [ ] 修改 `trainer/signals/dataset.py`：
+- [ ] 修改 `trainer/src/datasets/signals.py`：
   - 输入改为 47 维细分情感时序，6 通道
   - 输出改为 8 维元板块动量标签
   - **新增 `export_phase2_dataset()`**：导出每日特征用于 Agent 训练
@@ -637,7 +637,7 @@ momentum = clip((meta_sentiment[t+5] - meta_sentiment[t]) / (|meta_sentiment[t]|
 - [ ] 训练 IForest + LightGBM
 - [ ] 新增 `global_leader_sentiment` 跨行业传导特征（滞后相关性）
 - [ ] 新增 `market_beta` Beta敏感度特征（滚动20日相关性）
-- [ ] 新建 `trainer/signals/xai.py`：SHAP 分析模块（训练完成后自动运行）
+- [ ] 新建 `trainer/src/utils/signals_xai.py`：SHAP 分析模块（训练完成后自动运行）
 - [ ] ONNX 导出（TCN + IForest + LightGBM）
 
 ### Phase 2: Agent 训练系统
@@ -664,8 +664,8 @@ momentum = clip((meta_sentiment[t+5] - meta_sentiment[t]) / (|meta_sentiment[t]|
 | 文件 | 改动 |
 |------|------|
 | `data/meta_sector_mapping.json` | **新建**：47 细分 → 8 元板块 + 权重 |
-| `trainer/signals/dataset.py` | 重构 TCN 数据集（47 维输入，8 维输出，6 通道）；**新增 `export_phase2_dataset()`** |
-| `trainer/signals/xai.py` | **新建**：SHAP 分析模块（TreeExplainer、Summary/Force/Dependence Plot） |
+| `trainer/src/datasets/signals.py` | 重构 TCN 数据集（47 维输入，8 维输出，6 通道）；**新增 `export_phase2_dataset()`** |
+| `trainer/src/utils/signals_xai.py` | **新建**：SHAP 分析模块（TreeExplainer、Summary/Force/Dependence Plot） |
 | `src/agent/features.py` | **新建**：`build_agent_features()` 构建 A/B/C/D/E 五类特征 |
 | `src/agent/decision_logger.py` | **新建**：记录每周决策 + 实际收益 + Guardrail 事件 + TCN_Prediction_Error |
 | `src/agent/daily_guardrail.py` | **新建**：日频紧急退出监控逻辑 + FORBIDDEN_ZONE 状态机 |

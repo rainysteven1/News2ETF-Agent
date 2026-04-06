@@ -2,14 +2,10 @@
 
 from __future__ import annotations
 
-import tomllib
 from pathlib import Path
 from typing import Any
 
 from pydantic import BaseModel
-
-_ROOT = Path(__file__).resolve().parent.parent.parent
-
 
 # ─── TCN ──────────────────────────────────────────────────────────────────────
 
@@ -84,45 +80,7 @@ class SignalsConfig(BaseModel):
 
 
 def load_signals_config(path: str | Path | None = None) -> SignalsConfig:
-    """Load signals config from trainer/config.toml."""
-    if path is None:
-        path = _ROOT / "trainer" / "config.toml"
-    path = Path(path)
+    """Compatibility loader that delegates to the shared root config."""
+    from trainer.src.config.root import load_config
 
-    with open(path, "rb") as f:
-        raw: dict[str, Any] = tomllib.load(f)
-
-    toml_section = raw.get("signals", {})
-
-    filtered: dict[str, Any] = {}
-    toml_to_field = {
-        "tcn": "tcn",
-        "training": "training",
-        "isolation_forest": "isolation_forest",
-        "lightgbm": "lightgbm",
-        "dataset": "dataset",
-        "ohlcv": "ohlcv",
-    }
-    for toml_key, field_name in toml_to_field.items():
-        if toml_key in toml_section:
-            filtered[field_name] = toml_section[toml_key]
-
-    cfg = SignalsConfig.model_validate(filtered)
-
-    # Resolve relative paths
-    dataset_section = toml_section.get("dataset", {})
-    if "raw_data_path" in dataset_section:
-        cfg.dataset.raw_data_path = _ROOT / dataset_section["raw_data_path"]
-    if "output_sentiment" in dataset_section:
-        cfg.dataset.output_sentiment = _ROOT / dataset_section["output_sentiment"]
-
-    training_section = toml_section.get("training", {})
-    if "output_checkpoint" in training_section:
-        cfg.training.output_checkpoint = _ROOT / training_section["output_checkpoint"]
-
-    ohlcv_section = toml_section.get("ohlcv", {})
-    for key in ("ohlcv_path", "industry_dict_path", "etf_info_path"):
-        if key in ohlcv_section:
-            setattr(cfg.ohlcv, key, _ROOT / ohlcv_section[key])
-
-    return cfg
+    return load_config(path).signals

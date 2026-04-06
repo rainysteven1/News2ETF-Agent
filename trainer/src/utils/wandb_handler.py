@@ -1,4 +1,5 @@
 """Standalone W&B handler — runs alongside loguru, not instead of it."""
+
 from __future__ import annotations
 
 import os

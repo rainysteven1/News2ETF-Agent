@@ -3,6 +3,7 @@
 Phase 1: Major → intermediate parquet (major_category, sentiment, confidences)
 Phase 2: Sub-category (SetFit) → final output parquet
 """
+
 from __future__ import annotations
 
 import os
@@ -206,9 +207,7 @@ def run_setfit(limit_rows: int | None = None) -> None:
     intermediate_path = Path(finbert_output_path) if finbert_output_path else None
     if intermediate_path is None:
         assert output_path is not None, "output_path must be set in config.toml"
-        intermediate_path = (
-            Path(output_path).parent / f"{Path(output_path).stem}_major_only{Path(output_path).suffix}"
-        )
+        intermediate_path = Path(output_path).parent / f"{Path(output_path).stem}_major_only{Path(output_path).suffix}"
 
     if not intermediate_path.exists():
         raise FileNotFoundError(f"Intermediate Major result not found: {intermediate_path}")

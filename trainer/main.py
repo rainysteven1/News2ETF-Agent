@@ -12,8 +12,8 @@ Usage:
     python -m trainer.main sub supervised export-onnx --model-path ... --onnx-path ...
 
     python -m trainer.main predict all
-    python -m trainer.main predict finbert
-    python -m trainer.main predict setfit
+    python -m trainer.main predict major
+    python -m trainer.main predict sub
 """
 
 import functools
@@ -47,18 +47,24 @@ def _init_seed(seed: int):
         torch.cuda.manual_seed_all(seed)
 
 
+def _resolve_app_name(context: typer.Context) -> str:
+    current: typer.Context | None = context.parent
+    while current is not None:
+        info_name = current.info_name
+        if info_name in {"major", "sub", "signals", "predict"}:
+            return info_name
+        current = current.parent
+    raise ValueError("Unable to determine app name from context.")
+
+
 def _init_trainer(context: typer.Context, init_wandb: bool = True) -> None:
-    if context.parent is None:
-        raise ValueError("Trainer commands must be called from a subcommand.")
-    app_name: str | None = context.parent.info_name
-    if app_name is None:
-        raise ValueError("Unable to determine app name from context.")
+    app_name = _resolve_app_name(context)
 
     console.print(f"[bold blue]Initializing trainer for app: {app_name}[/bold blue]")
     init_config(app_name)
     init_logger()
 
-    if init_wandb and app_name not in ("sub",):
+    if init_wandb and app_name in {"major", "signals"}:
         WandbRegistry.init(app_name, tags=[app_name])
 
     _init_seed(get_config().seed)
@@ -71,7 +77,9 @@ def with_trainer_init(func: Callable | None = None, *, init_wandb: bool = True) 
             _init_trainer(ctx, init_wandb=init_wandb)
             fn(ctx, *args, **kwargs)
             WandbRegistry.finish_all()
+
         return wrapper
+
     if func is None:
         return decorator
     return decorator(func)
@@ -88,11 +96,14 @@ major_app = typer.Typer(add_completion=False)
 def major_train(ctx: typer.Context) -> None:
     """Train major category + sentiment classifier."""
     from trainer.src.pipelines.train_major import train_major
+
     train_major(device=device)
 
 
 @major_app.command("export-onnx")
+@with_trainer_init(init_wandb=False)
 def major_export_onnx(
+    ctx: typer.Context,
     model_path: str = typer.Option(..., "--model-path", "-i"),
     onnx_path: str = typer.Option(..., "--onnx-path", "-o"),
     max_seq_length: int = typer.Option(128, "--max-seq-length"),
@@ -100,6 +111,7 @@ def major_export_onnx(
 ) -> None:
     """Export a trained major model to ONNX."""
     from trainer.src.models.major import export_major_to_onnx
+
     export_major_to_onnx(Path(model_path), Path(onnx_path), max_seq_length, opset_version)
     console.print(f"[bold green]ONNX saved to: {onnx_path}[/bold green]")
 
@@ -124,6 +136,7 @@ def setfit_prepare(
 ) -> None:
     """Prepare datasets for SetFit training (cached)."""
     from trainer.src.datasets.sub import SetFitDatasetPreparer
+
     SetFitDatasetPreparer().prepare_all(majors=majors)
 
 
@@ -135,11 +148,14 @@ def setfit_train(
 ) -> None:
     """Train SetFit models per major (contrastive learning)."""
     from trainer.src.pipelines.train_sub_setfit import SetFitMultiMajorTrainer
+
     SetFitMultiMajorTrainer(device=device).train(majors=majors)
 
 
 @setfit_app.command("export-onnx")
+@with_trainer_init(init_wandb=False)
 def setfit_export(
+    ctx: typer.Context,
     model_path: str = typer.Option(..., "--model-path", "-i"),
     onnx_path: str = typer.Option(..., "--onnx-path", "-o"),
     max_seq_length: int = typer.Option(256, "--max-seq-length"),
@@ -147,6 +163,7 @@ def setfit_export(
 ) -> None:
     """Export a trained SetFit model to ONNX."""
     from trainer.src.models.sub import export_sub_to_onnx
+
     export_sub_to_onnx(Path(model_path), Path(onnx_path), max_seq_length, opset_version)
     console.print(f"[bold green]ONNX saved to: {onnx_path}[/bold green]")
 
@@ -165,11 +182,14 @@ def supervised_train(
 ) -> None:
     """Train sub-category classifiers (supervised fine-tune) per major."""
     from trainer.src.pipelines.train_sub_supervised import SubMultiMajorTrainer
+
     SubMultiMajorTrainer(get_config().sub, device).train(majors=majors)
 
 
 @supervised_app.command("export-onnx")
+@with_trainer_init(init_wandb=False)
 def supervised_export(
+    ctx: typer.Context,
     model_path: str = typer.Option(..., "--model-path", "-i"),
     onnx_path: str = typer.Option(..., "--onnx-path", "-o"),
     max_seq_length: int = typer.Option(128, "--max-seq-length"),
@@ -177,6 +197,7 @@ def supervised_export(
 ) -> None:
     """Export a trained Sub model to ONNX."""
     from trainer.src.models.sub import export_sub_to_onnx
+
     export_sub_to_onnx(Path(model_path), Path(onnx_path), max_seq_length, opset_version)
     console.print(f"[bold green]ONNX saved to: {onnx_path}[/bold green]")
 
@@ -188,30 +209,39 @@ predict_app = typer.Typer(add_completion=False)
 
 
 @predict_app.command("all")
+@with_trainer_init(init_wandb=False)
 def predict_all(
+    ctx: typer.Context,
     rows: int | None = typer.Option(None, "--rows", "-n"),
 ) -> None:
     """Run full pipeline: Major → SetFit."""
     from trainer.src.pipelines.predict import run as predict_run
+
     predict_run(limit_rows=rows)
 
 
-@predict_app.command("finbert")
-def predict_finbert(
+@predict_app.command("major")
+@with_trainer_init(init_wandb=False)
+def predict_major(
+    ctx: typer.Context,
     rows: int | None = typer.Option(None, "--rows", "-n"),
 ) -> None:
     """Phase 1: Major inference → intermediate parquet."""
     from trainer.src.pipelines.predict import run_finbert
+
     path = run_finbert(limit_rows=rows)
     console.print(f"[bold green]Major intermediate saved to: {path}[/bold green]")
 
 
-@predict_app.command("setfit")
-def predict_setfit(
+@predict_app.command("sub")
+@with_trainer_init(init_wandb=False)
+def predict_sub(
+    ctx: typer.Context,
     rows: int | None = typer.Option(None, "--rows", "-n"),
 ) -> None:
-    """Phase 2: SetFit sub-category classification on Major intermediate."""
+    """Phase 2: sub-category classification on Major intermediate."""
     from trainer.src.pipelines.predict import run_setfit
+
     run_setfit(limit_rows=rows)
 
 
@@ -228,7 +258,8 @@ def signals_train(
     force: bool = typer.Option(False, "--force", "-f"),
 ) -> None:
     """Run full TCN pipeline: pretrain → finetune → LightGBM."""
-    from trainer.signals.train import run_training
+    from trainer.src.pipelines.train_signals import run_training
+
     run_training(force=force)
 
 

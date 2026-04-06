@@ -185,9 +185,9 @@ class SetFitDatasetPreparer:
                 "cluster": True,
                 "samples": len(df_sampled),
                 "n_cap": self.dcfg.cluster.n_cap,
-                "n_clusters": self.cfg.setfit.data.cluster.n_clusters,
-                "samples_per_cluster": self.cfg.setfit.data.cluster.samples_per_cluster,
-                "min_samples_per_class": self.cfg.setfit.data.cluster.min_samples_per_class,
+                "n_clusters": self.dcfg.cluster.n_clusters,
+                "samples_per_cluster": self.dcfg.cluster.samples_per_cluster,
+                "min_samples_per_class": self.dcfg.cluster.min_samples_per_class,
             }
         else:
             df_sampled = self._random_sample(df)
@@ -195,8 +195,8 @@ class SetFitDatasetPreparer:
                 "major": major,
                 "cluster": False,
                 "samples": len(df_sampled),
-                "samples_per_class": self.cfg.setfit.data.random.samples_per_class,
-                "min_samples_per_class": self.cfg.setfit.data.random.min_samples_per_class,
+                "samples_per_class": self.dcfg.random.samples_per_class,
+                "min_samples_per_class": self.dcfg.random.min_samples_per_class,
             }
 
         df_sampled.write_parquet(out_path)
@@ -224,7 +224,7 @@ class SetFitDatasetPreparer:
 
     def _random_sample(self, df: pl.DataFrame) -> pl.DataFrame:
         """Random sample per sub-category, capped at samples_per_class with min_samples_per_class floor."""
-        rcfg = self.cfg.setfit.data.random
+        rcfg = self.dcfg.random
         sampled_parts: list[pl.DataFrame] = []
         for label in df["label_text"].unique():
             label_df = df.filter(pl.col("label_text") == label)
@@ -235,7 +235,7 @@ class SetFitDatasetPreparer:
 
     def _hard_negative_boost(self, df_sampled: pl.DataFrame, df_pool: pl.DataFrame) -> pl.DataFrame:
         """Boost samples for confused class pairs by mining hard negatives."""
-        ccfg = self.cfg.setfit.data.cluster
+        ccfg = self.dcfg.cluster
         boost_factor = getattr(ccfg, "hard_negative_boost", 3)
         confused_pairs = getattr(ccfg, "confused_pairs", [])
 
@@ -246,7 +246,7 @@ class SetFitDatasetPreparer:
 
         logger = get_logger()
         texts_pool = df_pool["text"].to_list()
-        embeddings_pool = self._get_embed_model().encode(texts_pool, show_progress_bar=False, batch_size=256)
+        self._get_embed_model().encode(texts_pool, show_progress_bar=False, batch_size=256)
 
         boosted_parts = [df_sampled.clone()]
 
@@ -285,14 +285,10 @@ class SetFitDatasetPreparer:
 
     def _cluster_sample(self, df: pl.DataFrame) -> pl.DataFrame:
         """Major-level joint clustering with label-balance + hard-negative + global-coverage."""
-        ccfg = self.cfg.setfit.data.cluster
+        ccfg = self.dcfg.cluster
         n_cap = ccfg.n_cap
         n_per_cluster = ccfg.samples_per_cluster
         n_min = ccfg.min_samples_per_class
-
-        from trainer.src.utils import get_logger
-
-        logger = get_logger()
 
         capped_parts: list[pl.DataFrame] = []
         for label in df["label_text"].unique():

@@ -1,4 +1,5 @@
 """Shared utilities: safe_name + LabelStats singleton."""
+
 from __future__ import annotations
 
 import json
@@ -25,7 +26,9 @@ class LabelStats:
         if cls._instance is not None:
             return cls._instance
 
-        label_stats_path = Path(__file__).resolve().parent.parent.parent / "data" / "labeled" / "setfit" / "label_stats.json"
+        label_stats_path = (
+            Path(__file__).resolve().parent.parent.parent / "data" / "labeled" / "setfit" / "label_stats.json"
+        )
         if label_stats_path.exists():
             with open(label_stats_path, encoding="utf-8") as f:
                 stats = json.load(f)

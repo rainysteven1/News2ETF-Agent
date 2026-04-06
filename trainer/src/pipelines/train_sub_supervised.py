@@ -124,7 +124,7 @@ class SupervisedMultiMajorTrainer:
         tokenizer = AutoTokenizer.from_pretrained(self.mcfg.pretrained_model)
 
         assert self.dcfg.raw_data_dir is not None, "supervised.data.raw_data_dir must be set in config"
-        assert self.tcfg.output_dir is not None, "supervised.training.ouptut_dir must be set in config"
+        assert self.tcfg.output_dir is not None, "supervised.training.output_dir must be set in config"
 
         all_majors = LabelStats.load().get_major_categories()
         target_majors = majors if majors is not None else all_majors
@@ -143,7 +143,7 @@ class SupervisedMultiMajorTrainer:
         summary_path = Path(self.tcfg.output_dir) / f"{run_prefix}.json"
         with open(summary_path, "w", encoding="utf-8") as f:
             json.dump(results, f, ensure_ascii=False, indent=2)
-        self.logger.info("[Sub] [Supervised] All models trained. Summary: {summary_path}")
+        self.logger.info(f"[Sub] [Supervised] All models trained. Summary: {summary_path}")
 
     def _train_one_major(self, major: str, tokenizer: AutoTokenizer, output_dir: Path) -> dict[str, Any]:
         self.logger.info(f"[Supervised] Training for major: {major}")

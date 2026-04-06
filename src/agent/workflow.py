@@ -39,6 +39,10 @@ def build_workflow(config: AgentRootConfig) -> CompiledStateGraph:
         agent_tools.compute_ml_signals,
         agent_tools.check_last_week_pnl,
         agent_tools.retrieve_history,
+        agent_tools.get_industry_top_news,
+        agent_tools.get_etf_candidates,
+        agent_tools.store_decision,
+        agent_tools.build_decision_context,
     ]
 
     # IndustryMapper for risk guard: mirror position detection + beta metadata

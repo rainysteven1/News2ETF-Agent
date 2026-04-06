@@ -1,4 +1,5 @@
 """Major (L1) dataset — news classification for major category + sentiment."""
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -8,7 +9,6 @@ import torch
 from sklearn.model_selection import train_test_split
 from torch.utils.data import Dataset
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
-
 
 L1_CATEGORIES: list[str] = [
     "主题策略",

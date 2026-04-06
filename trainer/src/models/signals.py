@@ -150,3 +150,109 @@ def export_tcn_to_onnx(
             "cls_output": {0: "batch_size"},
         },
     )
+
+
+class SpatialDropout(nn.Module):
+    """Spatial Dropout：对 47 维中的随机子集（所有 6 通道一起丢）"""
+
+    def __init__(self, p: float = 0.3):
+        super().__init__()
+        self.p = p
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (batch, seq_len, 47, 6)
+        if not self.training:
+            return x
+        mask = torch.rand(x.shape[0], 1, x.shape[2], 1, device=x.device) > self.p
+        return x * mask / (1 - self.p)
+
+
+class TCNFanIn(nn.Module):
+    """Fan-in TCN: 输入 (batch, seq_len, 47, 6) → 输出 (batch, 8) 元板块动量
+
+    架构：
+      1. Spatial Dropout（防止过拟合）
+      2. 空间压缩：47*6=282 → 128 → 64（MLP）
+      3. 时间建模：TCN stack（kernel_size=3, dilation=[1,2,4,8]）
+      4. 输出头：Linear(hidden, 8) — 8 个元板块动量
+    """
+
+    def __init__(
+        self,
+        n_sub=47,
+        n_meta=8,
+        input_size=6,
+        hidden_size=64,
+        num_layers=4,
+        kernel_size=3,
+        dropout=0.2,
+        spatial_dropout_p=0.3,
+    ):
+        super().__init__()
+        self.spatial_dropout = SpatialDropout(p=spatial_dropout_p)
+        self.spatial_mlp = nn.Sequential(
+            nn.Linear(n_sub * input_size, 128),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(128, hidden_size),
+        )
+        self.tcn = TCN(
+            input_size=hidden_size,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            kernel_size=kernel_size,
+            dropout=dropout,
+        )
+        self.reg_head = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size // 2),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_size // 2, n_meta),
+        )
+        self.scale = nn.Parameter(torch.ones(1))
+        self.cls_head = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size // 2),
+            nn.ReLU(),
+            nn.Linear(hidden_size // 2, 1),
+        )
+
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        # x: (batch, seq_len, 47, 6)
+        x = self.spatial_dropout(x)
+        batch, seq_len, n_sub, channels = x.shape
+        x = x.reshape(batch, seq_len, n_sub * channels)
+        x = self.spatial_mlp(x)  # (batch, seq_len, hidden_size)
+        x = x.transpose(1, 2)  # (batch, hidden_size, seq_len)
+        # Use TCN's temporal blocks directly (skip TCN's own heads/pooling)
+        for block in self.tcn.network:
+            x = block(x)
+        x = x.transpose(1, 2)  # (batch, seq_len, hidden_size)
+        x = x.mean(dim=1)  # (batch, hidden_size)
+        return torch.tanh(self.reg_head(x) * self.scale), torch.sigmoid(self.cls_head(x))
+
+
+def export_tcn_fanin_to_onnx(
+    model: TCNFanIn,
+    onnx_path: Path,
+    seq_len: int = 5,
+    n_sub: int = 47,
+    input_size: int = 6,
+    opset_version: int = 14,
+) -> None:
+    model.eval()
+    dummy = torch.randn(1, seq_len, n_sub, input_size)
+    onnx_path.parent.mkdir(parents=True, exist_ok=True)
+    torch.onnx.export(
+        model,
+        (dummy,),
+        onnx_path.as_posix(),
+        export_params=True,
+        opset_version=opset_version,
+        input_names=["input"],
+        output_names=["reg_output", "cls_output"],
+        dynamic_axes={
+            "input": {0: "batch_size"},
+            "reg_output": {0: "batch_size"},
+            "cls_output": {0: "batch_size"},
+        },
+    )

@@ -11,13 +11,13 @@ Topology:
 from __future__ import annotations
 
 import json
-from typing import Literal
+from typing import Any, Literal
 
 from langchain_core.messages import AIMessage, BaseMessage, ToolMessage
 
 from src.agent.client import LLMClient
 from src.agent.prompts import researcher_prompt, tool_descriptions, trader_prompt
-from src.agent.state import AgentState, TradeDecision
+from src.agent.state import AgentState, ETFSelections, MetaSectorPlan, SectorStatus, TradeDecision
 from src.config import AgentRootConfig
 
 # ─── Conditional Edges ──────────────────────────────────────────────────────────
@@ -75,6 +75,89 @@ def _langchain_to_openai_message(m: BaseMessage | ToolMessage) -> dict:
         msg["name"] = m.name
 
     return msg
+
+
+def _format_prompt_context(value: Any) -> str:
+    if not value:
+        return ""
+    if isinstance(value, str):
+        return value
+    return json.dumps(value, ensure_ascii=False, indent=2)
+
+
+def _build_trader_prompt(state: AgentState, config: AgentRootConfig, risk_warning: str = "") -> str:
+    msg_contents = []
+    for m in state.get("messages", []):
+        if not hasattr(m, "content") or not m.content:
+            continue
+        if isinstance(m, ToolMessage):
+            msg_contents.append(f"[{m.name}] {m.content[:300]}")
+        elif isinstance(m, AIMessage) and not getattr(m, "tool_calls", None):
+            msg_contents.append(m.content)
+    research_summary = "\n\n".join(msg_contents)
+
+    holdings_str = (
+        "\n".join(f"  - {ind}: {w:.3f}" for ind, w in state.get("last_week_holdings", {}).items() if w > 0)
+        or "  (empty)"
+    )
+    ctx = state.get("decision_context", {})
+    prompt = trader_prompt(
+        date=state["date"],
+        research_summary=research_summary,
+        last_week_pnl=state.get("last_week_pnl", 0.0),
+        holdings=holdings_str,
+        max_weight=config.agent.max_weight_per_industry,
+        max_total=config.agent.max_total_weight,
+        tcn_sequence=_format_prompt_context(ctx.get("tcn_sequence") or state.get("tcn_sequence")),
+        news_summary=_format_prompt_context(ctx.get("news_summary")),
+        market_state=_format_prompt_context(ctx.get("market_state")),
+        position_state=_format_prompt_context(ctx.get("position_state")),
+        sent_p_divergence=_format_prompt_context(ctx.get("sent_p_divergence")),
+        forbidden_sectors=_format_prompt_context(state.get("forbidden_sectors")),
+        good_patterns=_format_prompt_context(ctx.get("good_patterns")),
+        bad_patterns=_format_prompt_context(ctx.get("bad_patterns")),
+    )
+    if risk_warning:
+        return f"## Risk Guard Warning\n{risk_warning}\n\n{prompt}"
+    return prompt
+
+
+def _parse_trade_decisions(payload: Any) -> list[TradeDecision]:
+    if isinstance(payload, str):
+        payload = json.loads(payload)
+
+    if isinstance(payload, list):
+        return [TradeDecision(**item) for item in payload]
+
+    if not isinstance(payload, dict):
+        return []
+
+    level1_raw = payload.get("level1_plan", [])
+    level2_raw = payload.get("level2_plan", [])
+    if level1_raw or level2_raw:
+        return [
+            TradeDecision(
+                industry="meta_allocation",
+                action="hold",
+                weight=0.0,
+                reason=payload.get("reasoning_summary", payload.get("market_outlook", "")),
+                level1_plan=[MetaSectorPlan(**item) for item in level1_raw],
+                level2_plan=[ETFSelections(**item) for item in level2_raw],
+            )
+        ]
+
+    raw_decisions = payload.get("decisions", [])
+    return [
+        TradeDecision(
+            industry=item["industry"],
+            action=item["action"],
+            weight=item["weight"],
+            reason=item.get("reason", ""),
+            selected_indices=item.get("selected_indices", []),
+            selected_etf=item.get("selected_etf", ""),
+        )
+        for item in raw_decisions
+    ]
 
 
 def agent_node(state: AgentState, config: AgentRootConfig, bound_tools: list) -> dict:
@@ -139,33 +222,7 @@ def decide_node(state: AgentState, config: AgentRootConfig) -> dict:
         temperature=config.agent.llm_temperature,
     )
 
-    # Build clean research context — only researcher thinking (AIMessage) and raw evidence (ToolMessage)
-    msg_contents = []
-    for m in state.get("messages", []):
-        if not hasattr(m, "content") or not m.content:
-            continue
-        # ToolMessage content = raw evidence from tools
-        if isinstance(m, ToolMessage):
-            msg_contents.append(f"[{m.name}] {m.content[:300]}")
-        # AIMessage content = researcher thinking (skip tool call artifacts)
-        elif isinstance(m, AIMessage):
-            if not getattr(m, "tool_calls", None):
-                msg_contents.append(m.content)
-    research_summary = "\n\n".join(msg_contents)
-
-    holdings_str = (
-        "\n".join(f"  - {ind}: {w:.3f}" for ind, w in state.get("last_week_holdings", {}).items() if w > 0)
-        or "  (empty)"
-    )
-
-    prompt = trader_prompt(
-        date=state["date"],
-        research_summary=research_summary,
-        last_week_pnl=state.get("last_week_pnl", 0.0),
-        holdings=holdings_str,
-        max_weight=config.agent.max_weight_per_industry,
-        max_total=config.agent.max_total_weight,
-    )
+    prompt = _build_trader_prompt(state, config)
 
     # Try structured output first (OpenAI response_format)
     decisions: list[TradeDecision] = []
@@ -176,71 +233,51 @@ def decide_node(state: AgentState, config: AgentRootConfig) -> dict:
             response_model={
                 "type": "json_schema",
                 "json_schema": {
-                    "name": "WeeklyTradePlan",
+                    "name": "WeeklyTradePlanV2",
                     "schema": {
                         "type": "object",
                         "properties": {
-                            "decisions": {
+                            "level1_plan": {
                                 "type": "array",
                                 "items": {
                                     "type": "object",
                                     "properties": {
-                                        "industry": {"type": "string"},
+                                        "meta_sector": {"type": "string"},
                                         "action": {"type": "string", "enum": ["buy", "sell", "hold"]},
                                         "weight": {"type": "number", "minimum": 0.0, "maximum": 1.0},
                                         "reason": {"type": "string"},
-                                        "selected_indices": {
-                                            "type": "array",
-                                            "items": {"type": "string"},
-                                        },
+                                    },
+                                    "required": ["meta_sector", "action", "weight", "reason"],
+                                },
+                            },
+                            "level2_plan": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "meta_sector": {"type": "string"},
+                                        "selected_indices": {"type": "array", "items": {"type": "string"}},
                                         "selected_etf": {"type": "string"},
                                     },
-                                    "required": ["industry", "action", "weight", "reason"],
+                                    "required": ["meta_sector", "selected_indices", "selected_etf"],
                                 },
                             },
                             "market_outlook": {"type": "string"},
+                            "reasoning_summary": {"type": "string"},
                         },
-                        "required": ["decisions"],
+                        "required": ["level1_plan", "level2_plan"],
                     },
                 },
             },
         )
-        data = json.loads(result) if isinstance(result, str) else result
-        raw_decisions = data.get("decisions", [])
-        decisions = [
-            TradeDecision(
-                industry=d["industry"],
-                action=d["action"],
-                weight=d["weight"],
-                reason=d.get("reason", ""),
-                selected_indices=d.get("selected_indices", []),
-                selected_etf=d.get("selected_etf", ""),
-            )
-            for d in raw_decisions
-        ]
+        decisions = _parse_trade_decisions(result)
     except Exception:
-        # Fallback: plain JSON
         try:
             text = client.chat("", prompt).strip()
             if text.startswith("```"):
                 lines = text.split("\n")
                 text = "\n".join(lines[1:-1])
-            data = json.loads(text)
-            if isinstance(data, dict):
-                raw_decisions = data.get("decisions", [])
-                decisions = [
-                    TradeDecision(
-                        industry=d["industry"],
-                        action=d["action"],
-                        weight=d["weight"],
-                        reason=d.get("reason", ""),
-                        selected_indices=d.get("selected_indices", []),
-                        selected_etf=d.get("selected_etf", ""),
-                    )
-                    for d in raw_decisions
-                ]
-            elif isinstance(data, list):
-                decisions = [TradeDecision(**d) for d in data]
+            decisions = _parse_trade_decisions(text)
         except Exception:
             decisions = []
 
@@ -333,30 +370,7 @@ def trader_retry_node(state: AgentState, config: AgentRootConfig) -> dict:
         temperature=config.agent.llm_temperature,
     )
 
-    research_summary = "\n\n".join(
-        f"[{m.name}] {m.content[:300]}" if isinstance(m, ToolMessage) else m.content
-        for m in messages
-        if hasattr(m, "content")
-        and m.content
-        and (isinstance(m, ToolMessage) or (isinstance(m, AIMessage) and not getattr(m, "tool_calls", None)))
-    )
-
-    holdings_str = (
-        "\n".join(f"  - {ind}: {w:.3f}" for ind, w in state.get("last_week_holdings", {}).items() if w > 0)
-        or "  (empty)"
-    )
-
-    warning_block = f"\n\n## Risk Guard Warning\n{risk_warning}\n" if risk_warning else ""
-
-    prompt = trader_prompt(
-        date=state["date"],
-        research_summary=research_summary,
-        last_week_pnl=state.get("last_week_pnl", 0.0),
-        holdings=holdings_str,
-        max_weight=config.agent.max_weight_per_industry,
-        max_total=config.agent.max_total_weight,
-    )
-    prompt = warning_block + prompt
+    prompt = _build_trader_prompt(state, config, risk_warning=risk_warning)
 
     decisions: list[TradeDecision] = []
     try:
@@ -366,70 +380,51 @@ def trader_retry_node(state: AgentState, config: AgentRootConfig) -> dict:
             response_model={
                 "type": "json_schema",
                 "json_schema": {
-                    "name": "WeeklyTradePlan",
+                    "name": "WeeklyTradePlanV2",
                     "schema": {
                         "type": "object",
                         "properties": {
-                            "decisions": {
+                            "level1_plan": {
                                 "type": "array",
                                 "items": {
                                     "type": "object",
                                     "properties": {
-                                        "industry": {"type": "string"},
+                                        "meta_sector": {"type": "string"},
                                         "action": {"type": "string", "enum": ["buy", "sell", "hold"]},
                                         "weight": {"type": "number", "minimum": 0.0, "maximum": 1.0},
                                         "reason": {"type": "string"},
-                                        "selected_indices": {
-                                            "type": "array",
-                                            "items": {"type": "string"},
-                                        },
+                                    },
+                                    "required": ["meta_sector", "action", "weight", "reason"],
+                                },
+                            },
+                            "level2_plan": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "meta_sector": {"type": "string"},
+                                        "selected_indices": {"type": "array", "items": {"type": "string"}},
                                         "selected_etf": {"type": "string"},
                                     },
-                                    "required": ["industry", "action", "weight", "reason"],
+                                    "required": ["meta_sector", "selected_indices", "selected_etf"],
                                 },
                             },
                             "market_outlook": {"type": "string"},
+                            "reasoning_summary": {"type": "string"},
                         },
-                        "required": ["decisions"],
+                        "required": ["level1_plan", "level2_plan"],
                     },
                 },
             },
         )
-        data = json.loads(result) if isinstance(result, str) else result
-        raw_decisions = data.get("decisions", [])
-        decisions = [
-            TradeDecision(
-                industry=d["industry"],
-                action=d["action"],
-                weight=d["weight"],
-                reason=d.get("reason", ""),
-                selected_indices=d.get("selected_indices", []),
-                selected_etf=d.get("selected_etf", ""),
-            )
-            for d in raw_decisions
-        ]
+        decisions = _parse_trade_decisions(result)
     except Exception:
         try:
             text = client.chat("", prompt).strip()
             if text.startswith("```"):
                 lines = text.split("\n")
                 text = "\n".join(lines[1:-1])
-            data = json.loads(text)
-            if isinstance(data, dict):
-                raw_decisions = data.get("decisions", [])
-                decisions = [
-                    TradeDecision(
-                        industry=d["industry"],
-                        action=d["action"],
-                        weight=d["weight"],
-                        reason=d.get("reason", ""),
-                        selected_indices=d.get("selected_indices", []),
-                        selected_etf=d.get("selected_etf", ""),
-                    )
-                    for d in raw_decisions
-                ]
-            elif isinstance(data, list):
-                decisions = [TradeDecision(**d) for d in data]
+            decisions = _parse_trade_decisions(text)
         except Exception:
             decisions = []
 
@@ -443,19 +438,153 @@ def trader_retry_node(state: AgentState, config: AgentRootConfig) -> dict:
 # ─── Risk Check Node ──────────────────────────────────────────────────────────
 
 
-def risk_check_node(state: AgentState, config: AgentRootConfig, mapper=None) -> dict:
-    """Risk guard: validate weight constraints, mirror positions, Beta penalties, and handle empty decisions.
+def _meta_sector_beta(mapper, meta_sector: str) -> str:
+    """Get the highest beta among all sub-categories of a meta sector."""
+    if mapper is None:
+        return "medium"
+    from src.utils.meta_sector_map import meta_to_subs
 
-    - Empty decisions → default to all-hold (no position changes).
-    - Weight/size violations → retry to trader for soft correction.
-    - Mirror positions (same correlation cluster, both heavily weighted) → retry to trader.
-    - Beta penalty: if last_week_pnl < 0, no new very_high Beta buys → retry to trader.
-    - If passed → end.
-    """
-    from loguru import logger
-    decisions = state.get("decisions", [])
+    subs = meta_to_subs(meta_sector)
+    if not subs:
+        return "medium"
+    betas = [mapper.small_cat_beta(sub) for sub in subs]
+    # Priority: very_high > high > medium > low
+    priority = {"very_high": 4, "high": 3, "medium": 2, "low": 1}
+    return max(betas, key=lambda b: priority.get(b, 0), default="medium")
+
+
+def _meta_sector_cluster(mapper, meta_sector: str) -> str:
+    """Get the most common cluster among sub-categories of a meta sector."""
+    if mapper is None:
+        return meta_sector
+    from src.utils.meta_sector_map import meta_to_subs
+
+    subs = meta_to_subs(meta_sector)
+    if not subs:
+        return meta_sector
+    clusters = [mapper.small_cat_cluster(sub) for sub in subs]
+    # Return the most common cluster
+    from collections import Counter
+
+    return Counter(clusters).most_common(1)[0][0]
+
+
+def _normalize_level1_plan(
+    level1_plan: list[MetaSectorPlan],
+    meta_sectors: list[str],
+) -> tuple[list[MetaSectorPlan], list[str]]:
+    plan_by_sector = {item.meta_sector: item for item in level1_plan if item.meta_sector in meta_sectors}
+    notes: list[str] = []
+    normalized: list[MetaSectorPlan] = []
+    for sector in meta_sectors:
+        item = plan_by_sector.get(sector)
+        if item is None:
+            item = MetaSectorPlan(
+                meta_sector=sector,
+                action="hold",
+                weight=0.0,
+                reason="[AUTO_FILL] Missing sector in level1_plan",
+            )
+            notes.append(f"[{sector}] missing from level1_plan, auto-filled as hold")
+        normalized.append(item)
+    return normalized, notes
+
+
+def _apply_level1_risk_rules(
+    level1_plan: list[MetaSectorPlan],
+    state: AgentState,
+    config: AgentRootConfig,
+    mapper,
+) -> tuple[list[MetaSectorPlan], list[str]]:
     last_week_pnl: float = state.get("last_week_pnl", 0.0)
     last_holdings: dict[str, float] = state.get("last_week_holdings", {})
+    forbidden = state.get("forbidden_sectors", {})
+    errors: list[str] = []
+    adjusted: list[MetaSectorPlan] = []
+
+    for item in level1_plan:
+        plan = item.model_copy(deep=True)
+
+        if plan.meta_sector in forbidden and plan.action == "buy":
+            plan.action = "hold"
+            plan.weight = 0.0
+            plan.reason = f"[FORBIDDEN_ZONE] {plan.reason}".strip()
+            errors.append(f"[{plan.meta_sector}] forbidden zone active, buy downgraded to hold")
+
+        if plan.action == "buy" and 0 < plan.weight < 0.05:
+            plan.action = "hold"
+            plan.weight = 0.0
+            plan.reason = f"[MIN_THRESHOLD] {plan.reason}".strip()
+            errors.append(f"[{plan.meta_sector}] weight below 5%, downgraded to hold")
+
+        if plan.action == "buy" and plan.weight > config.agent.max_weight_per_industry:
+            plan.weight = config.agent.max_weight_per_industry
+            plan.reason = f"[WEIGHT_CAP] {plan.reason}".strip()
+            errors.append(f"[{plan.meta_sector}] weight capped to {config.agent.max_weight_per_industry:.2f}")
+
+        if last_week_pnl < 0 and mapper is not None and plan.action == "buy" and plan.weight > 0:
+            is_new_position = last_holdings.get(plan.meta_sector, 0.0) < 0.01
+            if is_new_position and _meta_sector_beta(mapper, plan.meta_sector) == "very_high":
+                plan.action = "hold"
+                plan.weight = 0.0
+                plan.reason = f"[BETA_PENALTY] {plan.reason}".strip()
+                errors.append(f"[{plan.meta_sector}] new very_high beta buy forbidden after losing week")
+
+        adjusted.append(plan)
+
+    total_buy_weight = sum(item.weight for item in adjusted if item.action == "buy")
+    if total_buy_weight > config.agent.max_total_weight > 0:
+        scale = config.agent.max_total_weight / total_buy_weight
+        errors.append(
+            f"[TOTAL_WEIGHT] scaled buy weights by {scale:.3f} to respect total cap {config.agent.max_total_weight:.2f}"
+        )
+        for item in adjusted:
+            if item.action == "buy":
+                item.weight = float(item.weight * scale)
+
+    if mapper is not None:
+        cluster_groups: dict[str, list[MetaSectorPlan]] = {}
+        for item in adjusted:
+            if item.action == "buy" and item.weight >= 0.15:
+                cluster_groups.setdefault(_meta_sector_cluster(mapper, item.meta_sector), []).append(item)
+        for cluster, items in cluster_groups.items():
+            if cluster == "unknown" or len(items) < 2:
+                continue
+            sorted_items = sorted(items, key=lambda p: p.weight, reverse=True)
+            for extra in sorted_items[1:]:
+                extra.weight = min(extra.weight, 0.14)
+                extra.reason = f"[MIRROR_CONFLICT] {extra.reason}".strip()
+                errors.append(f"[{extra.meta_sector}] reduced below 15% due to mirror cluster '{cluster}'")
+
+    return adjusted, errors
+
+
+def _apply_level2_risk_rules(
+    level2_plan: list[ETFSelections],
+    allowed_meta_sectors: set[str],
+) -> tuple[list[ETFSelections], list[str]]:
+    adjusted: list[ETFSelections] = []
+    errors: list[str] = []
+    seen: set[str] = set()
+    for item in level2_plan:
+        if item.meta_sector in seen:
+            errors.append(f"[{item.meta_sector}] duplicate Level 2 entry dropped")
+            continue
+        seen.add(item.meta_sector)
+        if item.meta_sector not in allowed_meta_sectors:
+            errors.append(f"[{item.meta_sector}] removed from Level 2 because Level 1 not active after risk")
+            continue
+        adjusted.append(item)
+    return adjusted, errors
+
+
+def risk_check_node(state: AgentState, config: AgentRootConfig, mapper=None) -> dict:
+    """Apply Level 1 then Level 2 risk constraints and auto-normalize the final plan."""
+    from loguru import logger
+
+    from src.utils.meta_sector_map import get_meta_sectors
+
+    decisions = state.get("decisions", [])
 
     if not decisions:
         logger.warning(
@@ -469,82 +598,35 @@ def risk_check_node(state: AgentState, config: AgentRootConfig, mapper=None) -> 
             "decisions": [],
         }
 
-    errors = []
-    adjusted_decisions: list[TradeDecision] = []
+    first_decision = decisions[0]
+    use_meta_format = bool(first_decision.level1_plan)
 
-    # ── Rule 6: Minimum operation threshold ─────────────────────────────────────
-    for d in decisions:
-        if d.action == "buy" and 0 < d.weight < 0.05:
-            errors.append(f"[{d.industry}] weight {d.weight:.3f} < 0.05 (min threshold) — downgraded to HOLD")
-        else:
-            adjusted_decisions.append(d)
-    decisions = adjusted_decisions
+    if not use_meta_format:
+        return {"is_risk_passed": True, "retry_count": state.get("retry_count", 0)}
 
-    # ── Basic weight constraints ───────────────────────────────────────────────
-    for d in decisions:
-        if d.action == "buy" and d.weight > config.agent.max_weight_per_industry:
-            errors.append(f"[{d.industry}] weight {d.weight:.3f} > max {config.agent.max_weight_per_industry}")
+    meta_sectors = get_meta_sectors()
+    normalized_level1, norm_notes = _normalize_level1_plan(first_decision.level1_plan, meta_sectors)
+    adjusted_level1, level1_notes = _apply_level1_risk_rules(
+        normalized_level1,
+        state=state,
+        config=config,
+        mapper=mapper,
+    )
 
-    total = sum(d.weight for d in decisions if d.action == "buy")
-    if total > config.agent.max_total_weight:
-        errors.append(f"Total weight {total:.3f} > max {config.agent.max_total_weight}")
+    allowed_level2 = {item.meta_sector for item in adjusted_level1 if item.action == "buy" and item.weight > 0}
+    adjusted_level2, level2_notes = _apply_level2_risk_rules(first_decision.level2_plan, allowed_level2)
 
-    # ── Beta penalty: no new very_high Beta buys when losing week ──────────────
-    if last_week_pnl < 0 and mapper is not None:
-        for d in decisions:
-            if d.action != "buy" or d.weight == 0:
-                continue
-            # Only check industries that are NOT already held (new positions only)
-            if d.industry in last_holdings:
-                continue
-            beta = mapper.small_cat_beta(d.industry)
-            if beta == "very_high":
-                errors.append(
-                    f"[Beta Penalty] last_week_pnl={last_week_pnl:.2%} < 0: "
-                    f"cannot ADD new very_high Beta position '{d.industry}'. "
-                    f"Either skip this or reduce to hold."
-                )
+    updated_decision = first_decision.model_copy(deep=True)
+    updated_decision.level1_plan = adjusted_level1
+    updated_decision.level2_plan = adjusted_level2
 
-    # ── Mirror position check via correlation clusters ─────────────────────────
-    if mapper is not None:
-        cluster_groups: dict[str, list[str]] = {}
-        for d in decisions:
-            if d.action == "buy" and d.weight >= 0.15:
-                cluster = mapper.small_cat_cluster(d.industry)
-                if cluster not in cluster_groups:
-                    cluster_groups[cluster] = []
-                cluster_groups[cluster].append(d.industry)
+    risk_notes = norm_notes + level1_notes + level2_notes
+    if risk_notes:
+        logger.info("[RISK GUARD] Applied {} adjustments for week {}", len(risk_notes), state.get("date", "unknown"))
 
-        for cluster, industries in cluster_groups.items():
-            if cluster == "unknown" or len(industries) < 2:
-                continue
-            industries_str = ", ".join(industries)
-            errors.append(
-                f"[Mirror Conflict] correlation_cluster='{cluster}': {industries_str} "
-                f"are mirrors — do NOT both hold at high weight. Reduce one to < 0.15."
-            )
-
-    if errors:
-        warning = (
-            "[RISK GUARD] Your decision violated constraints:\n"
-            + "\n".join(f"  - {e}" for e in errors)
-            + "\n请重新输出一个符合约束的 JSON 数组。"
-        )
-        retry_count = state.get("retry_count", 0) + 1
-        last_error = "; ".join(errors)
-
-        if retry_count >= 3:
-            logger.warning(
-                "[RISK GUARD] Retry limit reached for week {} — accepting as-is.",
-                state.get("date", "unknown"),
-            )
-            return {"is_risk_passed": True, "decisions": decisions, "retry_count": retry_count}
-
-        return {
-            "is_risk_passed": False,
-            "retry_count": retry_count,
-            "last_error": last_error,
-            "messages": [AIMessage(content=warning)],
-        }
-
-    return {"is_risk_passed": True, "retry_count": state.get("retry_count", 0)}
+    return {
+        "is_risk_passed": True,
+        "retry_count": state.get("retry_count", 0),
+        "decisions": [updated_decision],
+        "last_error": "; ".join(risk_notes),
+    }

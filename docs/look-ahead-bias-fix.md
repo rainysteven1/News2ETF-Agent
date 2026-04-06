@@ -18,7 +18,7 @@
 
 ## 一、LightGBM 特征修复
 
-文件：[trainer/signals/dataset.py](trainer/signals/dataset.py)
+文件：[trainer/src/datasets/signals.py](trainer/src/datasets/signals.py)
 
 ### 问题 1：`delta_sentiment` 用的是当期情感
 
@@ -70,7 +70,7 @@ vol_ma5 = np.array([np.mean(vol_arr[max(0, j - 5):j]) for j in range(i - seq_len
 
 ## 二、TCN vol_delta 修复
 
-文件：[trainer/signals/dataset.py](trainer/signals/dataset.py)
+文件：[trainer/src/datasets/signals.py](trainer/src/datasets/signals.py)
 
 ### 问题：`vol_delta` 用了当期成交量
 
@@ -131,7 +131,7 @@ volume_ratio = np.where(vol_arr[i:i + seq_len] > 0, vol_arr[i:i + seq_len] / (vo
 
 ## 四、IsolationForest 数据泄漏检查
 
-文件：[trainer/signals/dataset.py](trainer/signals/dataset.py) `build_isolation_forest_dataset`
+文件：[trainer/src/datasets/signals.py](trainer/src/datasets/signals.py) `build_isolation_forest_dataset`
 
 ```python
 for i in range(len(periods)):

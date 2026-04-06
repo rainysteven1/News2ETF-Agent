@@ -96,6 +96,8 @@ class DataConfig(BaseModel):
     etf_info: Path = _ROOT / "data" / "converted" / "主题ETF信息表-快照1_主题ETF.parquet"
     etf_prices: Path = _ROOT / "data" / "converted" / "主题ETF历史量价.parquet"
     industry_dict: Path = _ROOT / "data" / "industry_dict.json"
+    # Meta sector mapping
+    meta_sector_mapping: Path = _ROOT / "data" / "meta_sector_mapping.json"
     # Outputs
     output_sentiment: Path = _ROOT / "data" / "industry_sentiment.parquet"
     output_signals: Path = _ROOT / "data" / "ml_signals.parquet"
@@ -103,6 +105,7 @@ class DataConfig(BaseModel):
     output_logs: Path = _ROOT / "data" / "decision_logs.jsonl"
     output_backtest: Path = _ROOT / "data" / "backtest_results.parquet"
     output_weekly_returns: Path = _ROOT / "data" / "weekly_returns.parquet"
+    output_agent_features: Path = _ROOT / "data" / "agent_features.parquet"
     start_date: str = "2021-01-01"
     end_date: str = "2024-12-31"
 
@@ -149,12 +152,14 @@ def load_config(path: Path | str | None = None) -> AgentRootConfig:
         "etf_info",
         "etf_prices",
         "industry_dict",
+        "meta_sector_mapping",
         "output_sentiment",
         "output_signals",
         "output_trades",
         "output_logs",
         "output_backtest",
         "output_weekly_returns",
+        "output_agent_features",
     ):
         if key in data_section:
             raw["data"][key] = str(_ROOT / data_section[key])

@@ -423,12 +423,12 @@ shap_summary = {
 
 ```python
 # Phase 1 末新增
-- [ ] 新建 `trainer/signals/xai.py`：SHAP 分析模块
+- [ ] 新建 `trainer/src/utils/signals_xai.py`：SHAP 分析模块
   - `compute_shap_values(model, X_test)` → shap_values
   - `generate_summary_plot(shap_values, X_test, output_path)`
   - `generate_force_plot(shap_values, X_test, date, output_path)`
   - `export_shap_values(shap_values, dates)` → CSV for report
-- [ ] 修改 `trainer/signals/train.py`：训练完成后自动运行 SHAP 分析
+- [ ] 修改 `trainer/src/pipelines/train_signals.py`：训练完成后自动运行 SHAP 分析
 - [ ] 修改 `src/backtest/engine.py`：在回测报告中嵌入 SHAP 可视化
 ```
 
@@ -527,7 +527,7 @@ for sector in FORBIDDEN_ZONE:
 ### Phase 1: 模型训练基础设施
 - [x] `data/industry_dict.json`（已存在）
 - [ ] 新建 `data/meta_sector_mapping.json`（47 细分 → 8 元板块 + 权重）
-- [ ] 修改 `trainer/signals/dataset.py`：
+- [ ] 修改 `trainer/src/datasets/signals.py`：
   - 输入改为 47 维细分情感时序
   - 输出改为 8 维元板块动量标签
   - **新增 Phase 2 数据导出模式**：`export_phase2_dataset()` 导出每日特征用于 Agent 训练
@@ -559,7 +559,7 @@ for sector in FORBIDDEN_ZONE:
 | 文件 | 改动 |
 |------|------|
 | `data/meta_sector_mapping.json` | **新建**：47 细分 → 8 元板块 + 权重 |
-| `trainer/signals/dataset.py` | 重构 TCN 数据集（47 维输入，8 维输出，6 通道）；**新增 `export_phase2_dataset()`** |
+| `trainer/src/datasets/signals.py` | 重构 TCN 数据集（47 维输入，8 维输出，6 通道）；**新增 `export_phase2_dataset()`** |
 | `src/agent/features.py` | **新建**：`build_agent_features()` 构建 A/B/C/D/E 五类特征 |
 | `src/agent/decision_logger.py` | **新建**：记录每周决策 + 实际收益 + Guardrail 事件 + **TCN_Prediction_Error** |
 | `src/agent/daily_guardrail.py` | **新建**：日频紧急退出监控逻辑 + **FORBIDDEN_ZONE 状态机** |

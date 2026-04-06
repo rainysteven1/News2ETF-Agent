@@ -29,3 +29,6 @@ wandb/
 news2etf_swagger.json
 
 alembic/versions/*_auto.py
+
+.codex
+claude.md

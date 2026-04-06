@@ -1,4 +1,5 @@
 """Major (L1) model and training configuration — Level1 major category + sentiment."""
+
 from __future__ import annotations
 
 from pathlib import Path

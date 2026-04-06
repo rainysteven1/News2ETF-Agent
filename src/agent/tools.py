@@ -350,6 +350,79 @@ def store_decision(date: str, decision: str, context: str = "") -> str:
     return "Failed to store decision in Memos."
 
 
+# ─── build_decision_context ───────────────────────────────────────────────────
+
+
+@tool
+def build_decision_context(date: str) -> str:
+    """Build complete decision context by calling AgentFeatureBuilder.
+
+    This tool constructs all features (A/B/C/D/E) needed for agent decision making:
+    - Feature A: TCN sequence (8 meta sectors × 5 days momentum)
+    - Feature B: News summary (top news per meta sector)
+    - Feature C: Market state (price momentum, volume, volatility)
+    - Feature D: Position state (current holdings, weekly returns)
+    - Feature E: Sentiment vs price divergence
+
+    Returns a formatted string with all features for the agent.
+    """
+    from src.agent.features import AgentFeatureBuilder
+
+    builder = AgentFeatureBuilder()
+
+    # Build all features
+    features = builder.build_agent_features(
+        date=date,
+        current_holdings={},
+        current_time=f"{date} 08:30:00",
+    )
+
+    # Format output
+    lines = ["## Decision Context Features"]
+
+    # Feature A: TCN Sequence
+    lines.append("\n### A. TCN Sequence (8 Meta Sectors × 5 Days Momentum)")
+    tcn_seq = features.get("tcn_sequence", {})
+    for sector, values in tcn_seq.items():
+        vals_str = ", ".join(f"{v:.3f}" for v in values)
+        lines.append(f"  {sector}: [{vals_str}]")
+
+    # Feature B: News Summary
+    lines.append("\n### B. News Summary (Top 1 per Meta Sector)")
+    news_sum = features.get("news_summary", {})
+    for sector, news_list in news_sum.items():
+        if news_list:
+            lines.append(f"  {sector}: {news_list[0][:80]}...")
+        else:
+            lines.append(f"  {sector}: (no significant news)")
+
+    # Feature C: Market State
+    lines.append("\n### C. Market State")
+    market_state = features.get("market_state", {})
+    lines.append(f"  1-Week Return: {market_state.get('market_return_1w', 0):.2%}")
+    lines.append(f"  2-Week Return: {market_state.get('market_return_2w', 0):.2%}")
+    lines.append(f"  Market Volatility: {market_state.get('market_volatility', 0):.2%}")
+    lines.append(f"  Market State: {market_state.get('market_state', 'neutral')}")
+
+    # Feature D: Position State
+    lines.append("\n### D. Position State")
+    pos_state = features.get("position_state", {})
+    lines.append(f"  Total Weight: {pos_state.get('total_weight', 0):.2%}")
+    lines.append(f"  Invested Weight: {pos_state.get('invested_weight', 0):.2%}")
+    lines.append(f"  Number of Positions: {pos_state.get('num_positions', 0)}")
+    lines.append(f"  Agent 1W Performance: {pos_state.get('agent_perf_1w', 0):.2%}")
+    lines.append(f"  Agent 4W Performance: {pos_state.get('agent_perf_4w', 0):.2%}")
+
+    # Feature E: Sentiment vs Price Divergence
+    lines.append("\n### E. Sentiment vs Price Divergence")
+    sent_p_div = features.get("sent_p_divergence", {})
+    for sector, divergence in sent_p_div.items():
+        sign = "+" if divergence > 0 else ""
+        lines.append(f"  {sector}: {sign}{divergence:.3f}")
+
+    return "\n".join(lines)
+
+
 # ─── TOOL REGISTRY ────────────────────────────────────────────────────────────
 
 TOOL_REGISTRY = {
@@ -360,4 +433,5 @@ TOOL_REGISTRY = {
     "get_industry_top_news": get_industry_top_news,
     "get_etf_candidates": get_etf_candidates,
     "store_decision": store_decision,
+    "build_decision_context": build_decision_context,
 }
