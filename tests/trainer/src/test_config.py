@@ -6,12 +6,19 @@ from trainer.src.config.root import load_config
 def test_load_config_resolves_predict_paths():
     cfg = load_config()
 
-    assert isinstance(cfg.prediction.finbert_onnx_dir, Path)
-    assert isinstance(cfg.prediction.finbert_output_path, Path)
-    assert isinstance(cfg.prediction.input_path, Path)
-    assert isinstance(cfg.prediction.output_path, Path)
-    assert cfg.prediction.input_path.is_absolute()
-    assert cfg.prediction.output_path.is_absolute()
+    assert isinstance(cfg.prediction.major_onnx_dir, Path)
+    assert isinstance(cfg.prediction.major_output_dir, Path)
+    assert isinstance(cfg.prediction.sub_onnx_dir, Path)
+    assert isinstance(cfg.prediction.major_input_dir, Path)
+    assert isinstance(cfg.prediction.sub_input_dir, Path)
+    assert isinstance(cfg.prediction.output_dir, Path)
+    assert cfg.prediction.major_shard_workers > 0
+    assert cfg.prediction.sub_shard_workers > 0
+    assert cfg.prediction.sub_major_workers > 0
+    assert cfg.prediction.sub_backend in {"setfit", "supervised"}
+    assert cfg.prediction.major_input_dir.is_absolute()
+    assert cfg.prediction.sub_input_dir.is_absolute()
+    assert cfg.prediction.output_dir.is_absolute()
 
 
 def test_load_config_includes_signals_section_with_resolved_paths():

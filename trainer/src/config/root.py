@@ -20,15 +20,32 @@ class WandbConfig(BaseModel):
 
 
 class PredictionConfig(BaseModel):
-    finbert_onnx_dir: Path | None = None
-    finbert_output_path: Path | None = None
-    finbert_workers: int = 8
-    setfit_base_dir: Path | None = None
+    major_onnx_dir: Path | None = None
+    major_output_path: Path | None = None
+    major_output_dir: Path | None = None
+    major_workers: int = 8
+    major_shard_workers: int = 4
+    major_input_dir: Path | None = None
+    major_input_glob: str = "*.parquet"
+    major_input_path: Path | None = None
+    major_input_paths: list[Path] | None = None
+    sub_backend: Literal["setfit", "supervised"] = "setfit"
+    sub_onnx_dir: Path | None = None
+    sub_shard_workers: int = 4
+    sub_major_workers: int = 8
+    sub_input_dir: Path | None = None
+    sub_input_glob: str = "*.parquet"
+    sub_input_path: Path | None = None
+    sub_input_paths: list[Path] | None = None
+    input_dir: Path | None = None
+    input_glob: str = "*.parquet"
     input_path: Path | None = None
+    input_paths: list[Path] | None = None
     output_path: Path | None = None
+    output_dir: Path | None = None
     batch_size: int = 64
-    finbert_max_length: int = 128
-    setfit_max_length: int = 256
+    major_max_length: int = 128
+    sub_max_length: int = 256
 
 
 class RootConfig(BaseModel):
@@ -111,7 +128,9 @@ def load_config(path: str | Path | None = None) -> RootConfig:
 def _resolve_path_fields(section: dict[str, Any], root: Path) -> dict[str, Any]:
     resolved: dict[str, Any] = {}
     for key, val in section.items():
-        if isinstance(val, str) and (
+        if isinstance(val, list) and key.endswith("_paths"):
+            resolved[key] = [root / item if isinstance(item, str) else item for item in val]
+        elif isinstance(val, str) and (
             key.endswith("_path") or key.endswith("_dir") or key.endswith("_file") or key.endswith("_checkpoint")
         ):
             resolved[key] = root / val

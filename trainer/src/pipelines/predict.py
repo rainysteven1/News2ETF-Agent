@@ -1,19 +1,35 @@
-"""Batch inference: Major (FinBERT) + Sub (SetFit) ONNX pipeline.
+"""Batch inference: Major + Sub ONNX pipeline.
+
+Usage:
+    python -m trainer.main predict major --major-shard-workers 4
+    python -m trainer.main predict sub --sub-shard-workers 4 --sub-major-workers 8
+    python -m trainer.main predict all --major-shard-workers 4 --sub-shard-workers 4 --sub-major-workers 8
+
+Recommended:
+    - Configure `predict.major_input_dir` for raw news parquet shards
+    - Configure `predict.sub_input_dir` or `predict.sub_input_paths` explicitly for sub classification inputs
+    - Use process-level shard parallelism to exploit multi-core CPUs
+    - Keep per-process ONNX threads modest to avoid CPU oversubscription
 
 Phase 1: Major → intermediate parquet (major_category, sentiment, confidences)
-Phase 2: Sub-category (SetFit) → final output parquet
+Phase 2: Sub-category → final output parquet
 """
 
 from __future__ import annotations
 
+import json
 import os
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from pathlib import Path
+from queue import Queue
+from threading import Thread
 
 import numpy as np
 import onnxruntime as ort
 import polars as pl
+import pyarrow as pa
+import pyarrow.parquet as pq
 from loguru import logger
 from transformers import AutoTokenizer
 
@@ -31,7 +47,21 @@ def _make_ort_session(
     opts.intra_op_num_threads = intra_threads
     opts.inter_op_num_threads = inter_threads
     opts.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
-    return ort.InferenceSession(str(onnx_path), opts, providers=["CPUExecutionProvider"])
+    available = ort.get_available_providers()
+    preferred: list[str] = []
+    if "CUDAExecutionProvider" in available:
+        preferred.append("CUDAExecutionProvider")
+    preferred.append("CPUExecutionProvider")
+    session = ort.InferenceSession(str(onnx_path), opts, providers=preferred)
+    logger.info(f"[ORT] {onnx_path.name} providers={session.get_providers()}")
+    return session
+
+
+def _resolve_ort_threads(cpu_count: int, shard_workers: int) -> tuple[int, int]:
+    per_process_budget = max(1, cpu_count // max(1, shard_workers))
+    intra_threads = max(1, min(per_process_budget, 16))
+    inter_threads = 1
+    return intra_threads, inter_threads
 
 
 def _softmax(logits: np.ndarray) -> np.ndarray:
@@ -65,211 +95,490 @@ def _run_major_from_inputs(
     return sess.run(None, onnx_inputs)
 
 
-def run_finbert(limit_rows: int | None = None) -> Path | None:
-    """Run Major (FinBERT) inference; saves intermediate parquet and returns its path."""
-    cfg = load_config()
-    p = cfg.prediction
+def _scan_input_dir(input_dir: Path, pattern: str, required_columns: set[str] | None = None) -> list[Path]:
+    candidates = sorted(p for p in input_dir.glob(pattern) if p.is_file())
+    valid_inputs: list[Path] = []
+    for path in candidates:
+        if required_columns is None:
+            valid_inputs.append(path)
+            continue
+        try:
+            schema_names = set(pl.scan_parquet(path).collect_schema().names())
+        except Exception as exc:
+            logger.warning(f"[Predict] Skip unreadable parquet {path}: {exc}")
+            continue
+        if required_columns <= schema_names:
+            valid_inputs.append(path)
+        else:
+            logger.info(f"[Predict] Skip parquet with incompatible schema: {path}")
+    return valid_inputs
 
-    input_path = p.input_path
-    finbert_output_path = p.finbert_output_path
-    finbert_onnx_dir = p.finbert_onnx_dir
-    finbert_workers = p.finbert_workers
-    batch_size = p.batch_size
-    finbert_max_length = p.finbert_max_length
 
-    assert input_path is not None and finbert_output_path is not None, (
-        "input_path and finbert_output_path must be set in config.toml"
+def _get_major_input_paths(prediction_cfg) -> list[Path]:
+    if prediction_cfg.major_input_dir:
+        input_dir = Path(prediction_cfg.major_input_dir)
+        pattern = prediction_cfg.major_input_glob or "*.parquet"
+        return _scan_input_dir(input_dir, pattern, required_columns={"datetime", "title", "content"})
+    if prediction_cfg.major_input_paths:
+        return [Path(p) for p in prediction_cfg.major_input_paths]
+    if prediction_cfg.major_input_path:
+        return [Path(prediction_cfg.major_input_path)]
+    if prediction_cfg.input_dir:
+        input_dir = Path(prediction_cfg.input_dir)
+        pattern = prediction_cfg.input_glob or "*.parquet"
+        return _scan_input_dir(input_dir, pattern, required_columns={"datetime", "title", "content"})
+    if prediction_cfg.input_paths:
+        return [Path(p) for p in prediction_cfg.input_paths]
+    assert prediction_cfg.input_path is not None, "major input path(s) must be set in config.toml"
+    return [Path(prediction_cfg.input_path)]
+
+
+def _get_sub_input_paths(prediction_cfg) -> list[Path]:
+    if prediction_cfg.sub_input_dir:
+        input_dir = Path(prediction_cfg.sub_input_dir)
+        pattern = prediction_cfg.sub_input_glob or "*.parquet"
+        return _scan_input_dir(
+            input_dir,
+            pattern,
+            required_columns={"datetime", "title", "content", "major_category", "sentiment"},
+        )
+    if prediction_cfg.sub_input_paths:
+        return [Path(p) for p in prediction_cfg.sub_input_paths]
+    if prediction_cfg.sub_input_path:
+        return [Path(prediction_cfg.sub_input_path)]
+    return _get_major_intermediate_paths(prediction_cfg)
+
+
+def _get_prediction_input_paths(prediction_cfg) -> list[Path]:
+    if prediction_cfg.input_dir:
+        input_dir = Path(prediction_cfg.input_dir)
+        pattern = prediction_cfg.input_glob or "*.parquet"
+        return _scan_input_dir(input_dir, pattern, required_columns={"datetime", "title", "content"})
+    if prediction_cfg.input_paths:
+        return [Path(p) for p in prediction_cfg.input_paths]
+    assert prediction_cfg.input_path is not None, "input_path or input_paths must be set in config.toml"
+    return [Path(prediction_cfg.input_path)]
+
+
+def _get_major_intermediate_paths(prediction_cfg) -> list[Path]:
+    if prediction_cfg.major_output_dir:
+        output_dir = Path(prediction_cfg.major_output_dir)
+        return sorted(p for p in output_dir.glob("*_major_only.parquet") if p.is_file())
+    if prediction_cfg.input_dir:
+        input_paths = _get_prediction_input_paths(prediction_cfg)
+        return [
+            _derive_shard_output_path(input_path, prediction_cfg.major_output_path, "_major_only", len(input_paths))
+            for input_path in input_paths
+        ]
+    if prediction_cfg.input_paths:
+        return [
+            _derive_shard_output_path(
+                input_path, prediction_cfg.major_output_path, "_major_only", len(prediction_cfg.input_paths)
+            )
+            for input_path in prediction_cfg.input_paths
+        ]
+    assert prediction_cfg.major_output_path is not None, (
+        "major_output_path or major_output_dir must be set in config.toml"
     )
+    return [Path(prediction_cfg.major_output_path)]
 
+
+def _derive_major_output_path(input_path: Path, prediction_cfg, total_inputs: int) -> Path:
+    if prediction_cfg.major_output_dir is not None:
+        return Path(prediction_cfg.major_output_dir) / f"{input_path.stem}_major_only.parquet"
+    return _derive_shard_output_path(input_path, prediction_cfg.major_output_path, "_major_only", total_inputs)
+
+
+def _derive_sub_output_path(intermediate_path: Path, prediction_cfg, total_inputs: int) -> Path:
+    if prediction_cfg.output_dir is not None:
+        stem = intermediate_path.stem.removesuffix("_major_only")
+        return Path(prediction_cfg.output_dir) / f"{stem}_sub.parquet"
+    source_input = intermediate_path.with_name(
+        f"{intermediate_path.stem.removesuffix('_major_only')}{intermediate_path.suffix}"
+    )
+    return _derive_shard_output_path(source_input, prediction_cfg.output_path, "_sub", total_inputs)
+
+
+def _derive_shard_output_path(
+    input_path: Path,
+    configured_output: Path | None,
+    suffix: str,
+    total_inputs: int,
+) -> Path:
+    if configured_output is None:
+        return input_path.with_name(f"{input_path.stem}{suffix}{input_path.suffix}")
+    if total_inputs == 1:
+        return Path(configured_output)
+    base_output = Path(configured_output)
+    output_dir = base_output.parent if base_output.suffix else base_output
+    return output_dir / f"{input_path.stem}{suffix}{input_path.suffix}"
+
+
+def _effective_parallelism(requested: int | None, total_items: int) -> int:
+    if total_items <= 1:
+        return 1
+    cpu_count = os.cpu_count() or 1
+    max_reasonable = min(total_items, cpu_count)
+    if requested is None:
+        return max(1, min(max_reasonable, 4))
+    return max(1, min(requested, max_reasonable))
+
+
+def _should_log_progress(current_batch: int, total_batches: int, interval: int = 100) -> bool:
+    return current_batch == 1 or current_batch == total_batches or current_batch % interval == 0
+
+
+def _should_log_heartbeat(
+    current_batch: int,
+    total_batches: int,
+    now: float,
+    last_log_at: float,
+    min_interval_seconds: float = 5.0,
+) -> bool:
+    return _should_log_progress(current_batch, total_batches) or (now - last_log_at) >= min_interval_seconds
+
+
+def _build_major_batch_texts(batch_df: pl.DataFrame) -> list[str]:
+    texts: list[str] = []
+    for row in batch_df.iter_rows(named=True):
+        title, content = row["title"], row["content"]
+        if title is not None and title != "" and content is not None and content != "":
+            texts.append(f"{title} [SEP] {content[:256]}")
+        elif content is not None and content != "":
+            texts.append(content[:256])
+        else:
+            texts.append("")
+    return texts
+
+
+def _build_sub_text(row: dict[str, object]) -> str:
+    title = row["title"]
+    content = row["content"]
+    if title is not None and title != "" and content is not None and content != "":
+        return f"{title} [SEP] {str(content)[:256]}"
+    if content is not None and content != "":
+        return str(content)[:256]
+    return ""
+
+
+def _filter_major_batch_rows(batch_dict: dict[str, list[object]]) -> tuple[dict[str, list[object]], list[str], int]:
+    titles = batch_dict["title"]
+    contents = batch_dict["content"]
+    keep_indices: list[int] = []
+    texts: list[str] = []
+
+    for idx, (title, content) in enumerate(zip(titles, contents, strict=False)):
+        title_text = str(title) if title is not None else ""
+        content_text = str(content) if content is not None else ""
+        if title_text == "" and content_text == "":
+            continue
+        keep_indices.append(idx)
+        if title_text and content_text:
+            texts.append(f"{title_text} [SEP] {content_text[:256]}")
+        elif content_text:
+            texts.append(content_text[:256])
+        else:
+            texts.append("")
+
+    filtered_batch = {key: [values[i] for i in keep_indices] for key, values in batch_dict.items()}
+    skipped = len(titles) - len(keep_indices)
+    return filtered_batch, texts, skipped
+
+
+def _major_writer_worker(
+    output_path: Path,
+    queue: Queue[tuple[int, pa.Table] | None],
+) -> None:
+    writer: pq.ParquetWriter | None = None
+    try:
+        while True:
+            item = queue.get()
+            try:
+                if item is None:
+                    return
+                _, table = item
+                if writer is None:
+                    output_path.parent.mkdir(parents=True, exist_ok=True)
+                    writer = pq.ParquetWriter(output_path, table.schema)
+                writer.write_table(table)
+            finally:
+                queue.task_done()
+    finally:
+        if writer is not None:
+            writer.close()
+
+
+def _run_major_single(
+    input_path: Path,
+    major_output_path: Path,
+    major_onnx_dir: Path,
+    major_workers: int,
+    shard_workers: int,
+    batch_size: int,
+    major_max_length: int,
+    limit_rows: int | None = None,
+) -> Path:
     logger.info(f"[Major] Loading raw data: {input_path}")
-    df_raw = pl.read_parquet(input_path)
+    parquet_file = pq.ParquetFile(input_path)
+    total_rows = parquet_file.metadata.num_rows
+    schema_names = set(parquet_file.schema_arrow.names)
+    logger.info(f"[Major] Parquet opened: {input_path} | rows={total_rows}")
 
     required_cols = {"datetime", "title", "content"}
-    missing = required_cols - set(df_raw.columns)
+    missing = required_cols - schema_names
     if missing:
         raise ValueError(f"Input parquet missing required columns: {missing}")
 
-    both_empty = df_raw.filter(pl.col("title").is_null() & pl.col("content").is_null()).height
-    if both_empty > 0:
-        logger.info(f"[Major] Skipping {both_empty} rows with both title and content null")
-        df_raw = df_raw.filter(~(pl.col("title").is_null() & pl.col("content").is_null()))
-
-    if len(df_raw) == 0:
-        raise ValueError("No valid rows to process")
-
-    df_raw = df_raw.sort("datetime")
-
-    if limit_rows is not None:
-        df_raw = df_raw.head(limit_rows)
-
-    n = len(df_raw)
-    logger.info(f"[Major] {n} valid rows to process")
-
     cpu_count = os.cpu_count() or 1
-    intra_threads = 1
-    inter_threads = max(1, cpu_count // 8)
+    intra_threads, inter_threads = _resolve_ort_threads(cpu_count, shard_workers)
     logger.info(f"[Major] CPU cores={cpu_count}, ORT threads: intra={intra_threads}, inter={inter_threads}")
 
-    assert finbert_onnx_dir is not None, "FinBERT ONNX directory must be set in config.toml"
-    finbert_onnx_path = finbert_onnx_dir / "best.onnx"
-    finbert_tokenizer_path = finbert_onnx_dir / "tokenizer"
+    assert major_onnx_dir is not None, "major_onnx_dir must be set in config.toml"
+    major_onnx_path = major_onnx_dir / "best.onnx"
+    major_tokenizer_path = major_onnx_dir / "tokenizer"
 
-    if not finbert_onnx_path.exists():
-        raise FileNotFoundError(f"Major ONNX not found: {finbert_onnx_path}")
-    if not finbert_tokenizer_path.exists():
-        raise FileNotFoundError(f"Major tokenizer not found: {finbert_tokenizer_path}")
+    if not major_onnx_path.exists():
+        raise FileNotFoundError(f"Major ONNX not found: {major_onnx_path}")
+    if not major_tokenizer_path.exists():
+        raise FileNotFoundError(f"Major tokenizer not found: {major_tokenizer_path}")
 
-    logger.info(f"[Major] Loading Major ONNX: {finbert_onnx_path}")
-    finbert_sess = _make_ort_session(finbert_onnx_path, intra_threads, inter_threads)
-    finbert_tokenizer = AutoTokenizer.from_pretrained(str(finbert_tokenizer_path))
+    logger.info(f"[Major] Loading Major ONNX: {major_onnx_path}")
+    major_sess = _make_ort_session(major_onnx_path, intra_threads, inter_threads)
+    major_tokenizer = AutoTokenizer.from_pretrained(str(major_tokenizer_path))
 
-    texts_for_finbert: list[str | None] = []
-    for row in df_raw.iter_rows(named=True):
-        title, content = row["title"], row["content"]
-        if title is not None and title != "" and content is not None and content != "":
-            texts_for_finbert.append(f"{title} [SEP] {content[:256]}")
-        elif content is not None and content != "":
-            texts_for_finbert.append(content[:256])
-        else:
-            texts_for_finbert.append(None)
-
-    total_batches = (n + batch_size - 1) // batch_size
-    logger.info(f"[Major] {n} rows, {total_batches} batches...")
+    row_budget = limit_rows if limit_rows is not None else total_rows
+    total_batches = (row_budget + batch_size - 1) // batch_size
+    logger.info(f"[Major] Streaming {row_budget} rows, {total_batches} batches | tokenize + inference + parquet write")
     t0 = time.monotonic()
 
-    finbert_inputs_all: list[dict[str, np.ndarray]] = []
-    for i in range(0, n, batch_size):
-        batch_replaced = ["" if t is None else t for t in texts_for_finbert[i : i + batch_size]]
-        finbert_inputs_all.append(_tokenize(batch_replaced, finbert_tokenizer, finbert_max_length))
+    processed_input_rows = 0
+    written_rows = 0
+    skipped_rows = 0
+    last_tokenize_log_at = t0
+    last_infer_log_at = t0
+    write_queue: Queue[tuple[int, pa.Table] | None] = Queue(maxsize=8)
+    writer_thread = Thread(
+        target=_major_writer_worker,
+        args=(major_output_path, write_queue),
+        name=f"major-writer-{input_path.stem}",
+        daemon=True,
+    )
+    writer_thread.start()
 
-    majors_out = np.empty(n, dtype=object)
-    sents_out = np.empty(n, dtype=object)
-    l1_confs_out = np.empty(n, dtype=np.float64)
-    sent_confs_out = np.empty(n, dtype=np.float64)
+    if major_workers != 1:
+        logger.warning(
+            f"[Major] major_workers={major_workers} is over-parallel for CPU ONNX inference;"
+            " using synchronous per-process batching instead"
+        )
 
-    with ThreadPoolExecutor(max_workers=finbert_workers) as executor:
-        futures = []
-        for batch_idx in range(total_batches):
-            futures.append(
-                (batch_idx, executor.submit(_run_major_from_inputs, finbert_sess, finbert_inputs_all[batch_idx]))
-            )
+    batch_idx = 0
+    for batch in parquet_file.iter_batches(batch_size=batch_size):
+        if processed_input_rows >= row_budget:
+            break
 
-        for batch_idx, fb_future in futures:
-            start = batch_idx * batch_size
-            end = min(start + batch_size, n)
+        batch_dict = batch.to_pydict()
+        raw_batch_rows = len(next(iter(batch_dict.values()))) if batch_dict else 0
+        if raw_batch_rows == 0:
+            continue
 
-            l1_logits, sent_logits = fb_future.result()
+        if processed_input_rows + raw_batch_rows > row_budget:
+            keep = row_budget - processed_input_rows
+            batch_dict = {key: values[:keep] for key, values in batch_dict.items()}
+            raw_batch_rows = keep
 
-            l1_probs = _softmax(l1_logits)
-            l1_pred_idx = l1_probs.argmax(axis=1)
-            l1_conf = l1_probs[np.arange(len(l1_pred_idx)), l1_pred_idx]
+        processed_input_rows += raw_batch_rows
+        batch_idx += 1
+        filtered_batch, batch_texts, batch_skipped = _filter_major_batch_rows(batch_dict)
+        skipped_rows += batch_skipped
 
-            sent_probs = _softmax(sent_logits)
-            sent_pred_idx = sent_probs.argmax(axis=1)
-            sent_conf = sent_probs[np.arange(len(sent_pred_idx)), sent_pred_idx]
+        if batch_skipped > 0 and _should_log_progress(batch_idx, total_batches):
+            logger.info(f"[Major] Skipping {batch_skipped} empty rows in batch {batch_idx}/{total_batches}")
 
-            batch_majors = [L1_CATEGORIES[i] for i in l1_pred_idx]
-            batch_sents = [SENTIMENT_LABELS[i] for i in sent_pred_idx]
+        if not batch_texts:
+            continue
 
-            majors_out[start:end] = batch_majors
-            sents_out[start:end] = batch_sents
-            l1_confs_out[start:end] = l1_conf
-            sent_confs_out[start:end] = sent_conf
-
-            elapsed = time.monotonic() - t0
+        now = time.monotonic()
+        if _should_log_heartbeat(batch_idx, total_batches, now, last_tokenize_log_at):
             logger.info(
-                f"  Batch {batch_idx + 1}/{total_batches} | Major rows {start}-{end}/{n} | {elapsed:.1f}s total"
+                f"[Major] Tokenizing batch {batch_idx}/{total_batches} | input_rows={processed_input_rows}/{row_budget}"
             )
+            last_tokenize_log_at = now
 
-    result_df = df_raw.with_columns(
-        pl.Series("major_category", majors_out),
-        pl.Series("sentiment", sents_out),
-        pl.Series("l1_confidence", l1_confs_out),
-        pl.Series("sentiment_confidence", sent_confs_out),
-    ).sort("datetime")
+        inputs = _tokenize(batch_texts, major_tokenizer, major_max_length)
+        l1_logits, sent_logits = _run_major_from_inputs(major_sess, inputs)
 
-    finbert_output_path.parent.mkdir(parents=True, exist_ok=True)
-    result_df.write_parquet(finbert_output_path)
-    logger.success(f"[Major] Done → {finbert_output_path}")
-    return finbert_output_path
+        l1_probs = _softmax(l1_logits)
+        l1_pred_idx = l1_probs.argmax(axis=1)
+        l1_conf = l1_probs[np.arange(len(l1_pred_idx)), l1_pred_idx]
+
+        sent_probs = _softmax(sent_logits)
+        sent_pred_idx = sent_probs.argmax(axis=1)
+        sent_conf = sent_probs[np.arange(len(sent_pred_idx)), sent_pred_idx]
+
+        batch_majors = [L1_CATEGORIES[i] for i in l1_pred_idx]
+        batch_sents = [SENTIMENT_LABELS[i] for i in sent_pred_idx]
+        filtered_batch["major_category"] = batch_majors
+        filtered_batch["sentiment"] = batch_sents
+        filtered_batch["l1_confidence"] = l1_conf.tolist()
+        filtered_batch["sentiment_confidence"] = sent_conf.tolist()
+        table = pa.table(filtered_batch)
+        write_queue.put((batch_idx, table))
+        written_rows += len(batch_majors)
+
+        now = time.monotonic()
+        if _should_log_heartbeat(batch_idx, total_batches, now, last_infer_log_at):
+            elapsed = now - t0
+            logger.info(
+                f"[Major] Inference batch {batch_idx}/{total_batches}"
+                f" | written_rows={written_rows}/{row_budget - skipped_rows}"
+                f" | {elapsed:.1f}s total"
+            )
+            last_infer_log_at = now
+
+    write_queue.put(None)
+    write_queue.join()
+    writer_thread.join()
+    if written_rows == 0:
+        raise ValueError("No valid rows to process")
+    logger.success(f"[Major] Done → {major_output_path}")
+    return major_output_path
 
 
-def run_setfit(limit_rows: int | None = None) -> None:
-    """Run SetFit sub-category classification on Major intermediate output."""
+def run_major(
+    limit_rows: int | None = None,
+    overwrite: bool = False,
+    shard_workers: int | None = None,
+) -> list[Path]:
+    """Run Major inference shard-by-shard and return all intermediate output paths."""
     cfg = load_config()
     p = cfg.prediction
 
-    output_path = p.output_path
-    finbert_output_path = p.finbert_output_path
-    setfit_base_dir = p.setfit_base_dir
-    setfit_max_length = p.setfit_max_length
+    input_paths = _get_major_input_paths(p)
+    assert input_paths, "No valid raw parquet files found in predict input source"
+    assert p.major_output_dir is not None or p.major_output_path is not None, (
+        "major_output_dir or major_output_path must be set in config.toml"
+    )
+    assert p.major_onnx_dir is not None, "major_onnx_dir must be set in config.toml"
 
-    intermediate_path = Path(finbert_output_path) if finbert_output_path else None
-    if intermediate_path is None:
-        assert output_path is not None, "output_path must be set in config.toml"
-        intermediate_path = Path(output_path).parent / f"{Path(output_path).stem}_major_only{Path(output_path).suffix}"
+    total_inputs = len(input_paths)
+    outputs: list[Path] = []
+    pending_jobs: list[tuple[Path, Path]] = []
+    for input_path in input_paths:
+        output_path = _derive_major_output_path(input_path, p, total_inputs)
+        if output_path.exists() and not overwrite:
+            logger.info(f"[Major] Skip existing shard output: {output_path}")
+            outputs.append(output_path)
+            continue
+        pending_jobs.append((input_path, output_path))
 
-    if not intermediate_path.exists():
-        raise FileNotFoundError(f"Intermediate Major result not found: {intermediate_path}")
+    requested_shard_workers = shard_workers if shard_workers is not None else p.major_shard_workers
+    workers = _effective_parallelism(requested_shard_workers, len(pending_jobs))
+    if pending_jobs and workers > 1:
+        logger.info(f"[Major] Running {len(pending_jobs)} shards with {workers} processes")
+        with ProcessPoolExecutor(max_workers=workers) as executor:
+            futures = {
+                executor.submit(
+                    _run_major_single,
+                    input_path,
+                    output_path,
+                    p.major_onnx_dir,
+                    p.major_workers,
+                    workers,
+                    p.batch_size,
+                    p.major_max_length,
+                    limit_rows,
+                ): output_path
+                for input_path, output_path in pending_jobs
+            }
+            for future in as_completed(futures):
+                outputs.append(future.result())
+    else:
+        for input_path, output_path in pending_jobs:
+            outputs.append(
+                _run_major_single(
+                    input_path=input_path,
+                    major_output_path=output_path,
+                    major_onnx_dir=p.major_onnx_dir,
+                    major_workers=p.major_workers,
+                    shard_workers=workers,
+                    batch_size=p.batch_size,
+                    major_max_length=p.major_max_length,
+                    limit_rows=limit_rows,
+                )
+            )
+    outputs.sort()
+    return outputs
 
-    logger.info(f"[SetFit] Loading Major intermediate: {intermediate_path}")
+
+def _run_sub_single(
+    intermediate_path: Path,
+    output_path: Path,
+    sub_onnx_dir: Path,
+    sub_backend: str,
+    sub_max_length: int,
+    sub_major_workers: int,
+    shard_workers: int,
+    limit_rows: int | None = None,
+) -> Path:
+    """Run sub-category classification on one Major intermediate shard."""
+    logger.info(f"[Sub/{sub_backend}] Loading Major intermediate: {intermediate_path}")
     df = pl.read_parquet(intermediate_path)
+    logger.info(f"[Sub/{sub_backend}] Intermediate parquet loaded: {intermediate_path} | rows={len(df)}")
 
     if limit_rows is not None:
         df = df.head(limit_rows)
+        logger.info(f"[Sub/{sub_backend}] Applied row limit: {limit_rows}")
 
     n = len(df)
-    logger.info(f"[SetFit] {n} rows to classify")
+    logger.info(f"[Sub/{sub_backend}] {n} rows to classify")
 
     cpu_count = os.cpu_count() or 1
-    intra_threads = 1
-    inter_threads = max(1, cpu_count // 8)
-    logger.info(f"[SetFit] CPU cores={cpu_count}, ORT threads: intra={intra_threads}, inter={inter_threads}")
+    intra_threads, inter_threads = _resolve_ort_threads(cpu_count, shard_workers)
+    logger.info(f"[Sub/{sub_backend}] CPU cores={cpu_count}, ORT threads: intra={intra_threads}, inter={inter_threads}")
 
     label_stats = LabelStats.load()
     major_categories = label_stats.get_major_categories()
     major_to_subcats: dict[str, list[str]] = {m: label_stats.get_sub_categories(m) for m in major_categories}
 
-    setfit_sessions: dict[str, ort.InferenceSession] = {}
-    setfit_tokenizers: dict[str, AutoTokenizer] = {}
+    sub_sessions: dict[str, ort.InferenceSession] = {}
+    sub_tokenizers: dict[str, AutoTokenizer] = {}
+    sub_labels_by_major: dict[str, list[str]] = {}
 
-    assert setfit_base_dir is not None, "SetFit base directory must be set in config.toml"
+    assert sub_onnx_dir is not None, "sub_onnx_dir must be set in config.toml"
 
     for m in major_categories:
         safe = safe_name(m)
-        major_dir = setfit_base_dir / safe
+        major_dir = sub_onnx_dir / safe
         onnx_path = major_dir / "best.onnx"
         tokenizer_path = major_dir / "tokenizer"
+        label_map_path = major_dir / "label_map.json"
 
         if not onnx_path.exists() or not tokenizer_path.exists():
-            logger.warning(f"[SetFit] ONNX/tokenizer not found for '{safe}', will use fallback '其他'")
+            logger.warning(f"[Sub/{sub_backend}] ONNX/tokenizer not found for '{safe}', will use fallback '其他'")
             continue
 
-        logger.info(f"[SetFit] Loading SetFit for '{safe}'")
-        setfit_sessions[safe] = _make_ort_session(onnx_path, intra_threads, inter_threads)
-        setfit_tokenizers[safe] = AutoTokenizer.from_pretrained(str(tokenizer_path))
+        logger.info(f"[Sub/{sub_backend}] Loading ONNX for '{safe}'")
+        sub_sessions[safe] = _make_ort_session(onnx_path, intra_threads, inter_threads)
+        sub_tokenizers[safe] = AutoTokenizer.from_pretrained(str(tokenizer_path))
+        if sub_backend == "supervised" and label_map_path.exists():
+            with open(label_map_path, encoding="utf-8") as f:
+                label_map = json.load(f)
+            idx_to_label = label_map.get("idx_to_label", {})
+            sub_labels_by_major[safe] = [idx_to_label[str(i)] for i in range(len(idx_to_label))]
 
-    if not setfit_sessions:
-        raise RuntimeError("No SetFit ONNX models loaded")
+    if not sub_sessions:
+        raise RuntimeError(f"No sub ONNX models loaded for backend={sub_backend}")
+    logger.info(f"[Sub/{sub_backend}] Loaded {len(sub_sessions)} per-major ONNX models")
 
     subcats_lookup = {
         **{k: v for k, v in major_to_subcats.items()},
         **{safe_name(k): v for k, v in major_to_subcats.items()},
     }
 
-    texts_for_setfit: list[str | None] = []
-    for row in df.iter_rows(named=True):
-        title, content = row["title"], row["content"]
-        if title is not None and title != "" and content is not None and content != "":
-            texts_for_setfit.append(f"{title} [SEP] {content[:256]}")
-        elif content is not None and content != "":
-            texts_for_setfit.append(content[:256])
-        else:
-            texts_for_setfit.append(None)
-
     safe_to_global_idx: dict[str, list[int]] = {}
     safe_to_texts: dict[str, list[str]] = {}
 
+    logger.info(f"[Sub/{sub_backend}] Grouping rows by major category")
     for i, row in df.iter_rows(named=True):
         major = row["major_category"]
         safe = safe_name(major)
@@ -277,39 +586,46 @@ def run_setfit(limit_rows: int | None = None) -> None:
             safe_to_global_idx[safe] = []
             safe_to_texts[safe] = []
         safe_to_global_idx[safe].append(i)
-        t = texts_for_setfit[i]
-        safe_to_texts[safe].append("" if t is None else t)
+        safe_to_texts[safe].append(_build_sub_text(row))
+    logger.info(f"[Sub/{sub_backend}] Grouping complete: {len(safe_to_global_idx)} major buckets")
 
     sub_cats_out = np.full(n, "其他", dtype=object)
     sub_confs_out = np.zeros(n, dtype=np.float64)
 
     t0 = time.monotonic()
 
-    with ThreadPoolExecutor(max_workers=8) as executor:
+    with ThreadPoolExecutor(max_workers=_effective_parallelism(sub_major_workers, len(safe_to_global_idx))) as executor:
         futures = {}
+        total_groups = len(safe_to_global_idx)
+        submitted_groups = 0
 
         for safe, g_indices in safe_to_global_idx.items():
-            if safe not in setfit_sessions:
-                sub_cats = subcats_lookup.get(safe, ["其他"])
+            if safe not in sub_sessions:
+                sub_cats = sub_labels_by_major.get(safe, subcats_lookup.get(safe, ["其他"]))
                 for g in g_indices:
                     sub_cats_out[g] = sub_cats[-1]
                     sub_confs_out[g] = 0.0
-                logger.info(f"  SetFit fallback {safe}: {len(g_indices)} rows (no model)")
+                logger.info(f"  Sub/{sub_backend} fallback {safe}: {len(g_indices)} rows (no model)")
                 continue
 
             texts_list = safe_to_texts[safe]
+            submitted_groups += 1
+            logger.info(
+                f"[Sub/{sub_backend}] Tokenizing group {submitted_groups}/{total_groups}"
+                f" | major={safe} | rows={len(g_indices)}"
+            )
 
             def _classify(safe_m: str, g_idx: list[int], txts: list[str]):
-                inputs = _tokenize(txts, setfit_tokenizers[safe_m], setfit_max_length)
+                inputs = _tokenize(txts, sub_tokenizers[safe_m], sub_max_length)
                 onnx_in = {
                     "input_ids": inputs["input_ids"].astype(np.int64),
                     "attention_mask": inputs["attention_mask"].astype(np.int64),
                 }
-                logits = setfit_sessions[safe_m].run(None, onnx_in)[0]
+                logits = sub_sessions[safe_m].run(None, onnx_in)[0]
                 probs = _softmax(logits)
                 pred_idx = probs.argmax(axis=1)
                 conf = probs[np.arange(len(pred_idx)), pred_idx]
-                sub_cats = subcats_lookup.get(safe_m, ["其他"])
+                sub_cats = sub_labels_by_major.get(safe_m, subcats_lookup.get(safe_m, ["其他"]))
                 results = []
                 for g, p_idx, c_val in zip(g_idx, pred_idx.tolist(), conf.tolist()):
                     safe_idx = min(p_idx, len(sub_cats) - 1)
@@ -324,25 +640,104 @@ def run_setfit(limit_rows: int | None = None) -> None:
                 sub_cats_out[g] = sub_cat
                 sub_confs_out[g] = conf_val
             elapsed = time.monotonic() - t0
-            logger.info(f"  SetFit {safe_major}: {len(results)} rows | {elapsed:.1f}s total")
+            logger.info(
+                f"[Sub/{sub_backend}] Inference complete | major={safe_major}"
+                f" | rows={len(results)} | {elapsed:.1f}s total"
+            )
 
     result_df = df.with_columns(
         pl.Series("sub_category", sub_cats_out),
         pl.Series("sub_category_confidence", sub_confs_out),
-    ).sort("datetime")
+    )
 
-    assert output_path is not None
     output_path.parent.mkdir(parents=True, exist_ok=True)
     result_df.write_parquet(output_path)
-    logger.success(f"[SetFit] Complete output → {output_path}")
+    logger.success(f"[Sub/{sub_backend}] Complete output → {output_path}")
+    return output_path
 
 
-def run(limit_rows: int | None = None) -> None:
-    """Run full pipeline: Major → SetFit."""
+def run_sub(
+    limit_rows: int | None = None,
+    overwrite: bool = False,
+    shard_workers: int | None = None,
+    sub_major_workers: int | None = None,
+) -> list[Path]:
+    """Run sub-category classification shard-by-shard and return final output paths."""
+    cfg = load_config()
+    p = cfg.prediction
+
+    intermediate_paths = _get_sub_input_paths(p)
+    assert intermediate_paths, "No sub input parquet files found in configured source"
+    assert p.output_dir is not None or p.output_path is not None, "output_dir or output_path must be set in config.toml"
+    assert p.sub_onnx_dir is not None, "sub_onnx_dir must be set in config.toml"
+
+    total_inputs = len(intermediate_paths)
+    outputs: list[Path] = []
+    pending_jobs: list[tuple[Path, Path]] = []
+    for intermediate_path in intermediate_paths:
+        output_path = _derive_sub_output_path(intermediate_path, p, total_inputs)
+        if output_path.exists() and not overwrite:
+            logger.info(f"[Sub/{p.sub_backend}] Skip existing shard output: {output_path}")
+            outputs.append(output_path)
+            continue
+        pending_jobs.append((intermediate_path, output_path))
+
+    requested_shard_workers = shard_workers if shard_workers is not None else p.sub_shard_workers
+    workers = _effective_parallelism(requested_shard_workers, len(pending_jobs))
+    if pending_jobs and workers > 1:
+        logger.info(f"[Sub/{p.sub_backend}] Running {len(pending_jobs)} shards with {workers} processes")
+        with ProcessPoolExecutor(max_workers=workers) as executor:
+            futures = {
+                executor.submit(
+                    _run_sub_single,
+                    intermediate_path,
+                    output_path,
+                    p.sub_onnx_dir,
+                    p.sub_backend,
+                    p.sub_max_length,
+                    sub_major_workers if sub_major_workers is not None else p.sub_major_workers,
+                    workers,
+                    limit_rows,
+                ): output_path
+                for intermediate_path, output_path in pending_jobs
+            }
+            for future in as_completed(futures):
+                outputs.append(future.result())
+    else:
+        for intermediate_path, output_path in pending_jobs:
+            outputs.append(
+                _run_sub_single(
+                    intermediate_path=intermediate_path,
+                    output_path=output_path,
+                    sub_onnx_dir=p.sub_onnx_dir,
+                    sub_backend=p.sub_backend,
+                    sub_max_length=p.sub_max_length,
+                    sub_major_workers=sub_major_workers if sub_major_workers is not None else p.sub_major_workers,
+                    shard_workers=workers,
+                    limit_rows=limit_rows,
+                )
+            )
+    outputs.sort()
+    return outputs
+
+
+def run(
+    limit_rows: int | None = None,
+    overwrite: bool = False,
+    major_shard_workers: int | None = None,
+    sub_shard_workers: int | None = None,
+    sub_major_workers: int | None = None,
+) -> None:
+    """Run full pipeline shard-by-shard: Major → sub-category classification."""
     logger.info("[Predict] === Phase 1: Major ===")
-    run_finbert(limit_rows=limit_rows)
+    run_major(limit_rows=limit_rows, overwrite=overwrite, shard_workers=major_shard_workers)
 
-    logger.info("[Predict] === Phase 2: SetFit sub-category ===")
-    run_setfit(limit_rows=limit_rows)
+    logger.info("[Predict] === Phase 2: Sub-category ===")
+    run_sub(
+        limit_rows=limit_rows,
+        overwrite=overwrite,
+        shard_workers=sub_shard_workers,
+        sub_major_workers=sub_major_workers,
+    )
 
     logger.info("[Predict] === All done ===")

@@ -129,12 +129,27 @@ anomaly_threshold = 0.03
 output_checkpoint = "./trainer/checkpoints/signals"
 
 [predict]
-finbert_onnx_dir = "./trainer/checkpoints/major"
-finbert_output_path = "./trainer/data/labeled/signals/major_only.parquet"
-finbert_workers = 16
-setfit_base_dir = "./trainer/checkpoints/setfit"
-input_path = "./trainer/data/news_raw.parquet"
-output_path = "./trainer/data/labeled/signals/raw.parquet"
-batch_size = 64
-finbert_max_length = 128
-setfit_max_length = 256
+# Phase 1 major prediction:
+#   - reads raw news parquet shards from major_input_dir / major_input_glob
+#   - writes major-labeled parquet shards into major_output_dir
+major_onnx_dir = "./trainer/checkpoints/major"
+major_output_dir = "./trainer/data/labeled/signals/major_only"
+major_workers = 1
+major_shard_workers = 2
+major_input_dir = "./trainer/data/news_raw"
+major_input_glob = "*.parquet"
+
+# Phase 2 sub prediction:
+#   - reads explicitly from sub_input_dir / sub_input_glob
+#   - falls back to major_output_dir only if sub_input_* is not configured
+#   - writes final labeled parquet shards into output_dir
+sub_backend = "setfit"
+sub_onnx_dir = "./trainer/checkpoints/setfit"
+sub_shard_workers = 4
+sub_major_workers = 8
+sub_input_dir = "./trainer/data/labeled/signals/major_only"
+sub_input_glob = "*_major_only.parquet"
+output_dir = "./trainer/data/labeled/signals/raw"
+batch_size = 256
+major_max_length = 128
+sub_max_length = 256

@@ -27,8 +27,7 @@ from sklearn.metrics import r2_score
 from torch.optim.adam import Adam
 from torch.utils.data import DataLoader, TensorDataset
 
-from trainer.config import get_config
-from trainer.src.config import load_config
+from trainer.src.config import get_config, load_config
 from trainer.src.config.signals import SignalsConfig
 from trainer.src.datasets.signals import (
     WeeklySignalDataset,
@@ -41,7 +40,7 @@ from trainer.src.datasets.signals import (
     export_phase2_dataset,
 )
 from trainer.src.models.signals import TCN, TCNFanIn, export_tcn_fanin_to_onnx
-from trainer.wandb_handler import WandbHandler, WandbRegistry
+from trainer.src.utils import WandbHandler, WandbRegistry
 
 # ─── Model Training ─────────────────────────────────────────────────────────────
 

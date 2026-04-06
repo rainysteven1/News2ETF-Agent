@@ -13,7 +13,14 @@ Usage:
 
     python -m trainer.main predict all
     python -m trainer.main predict major
-    python -m trainer.main predict sub
+    python -m trainer.main predict sub --sub-shard-workers 4 --sub-major-workers 8
+
+Recommended for multi-file inference:
+    - Put raw news parquet shards into `predict.major_input_dir`
+    - Put major-labeled parquet shards into `predict.sub_input_dir`
+    - Run `predict major` first, then `predict sub`, or point `predict sub` at a cached input directory
+    - Use shard workers for process-level parallelism and sub major workers for per-major parallelism
+    - Re-run without `--overwrite` to resume from finished shards
 """
 
 import functools
@@ -213,11 +220,21 @@ predict_app = typer.Typer(add_completion=False)
 def predict_all(
     ctx: typer.Context,
     rows: int | None = typer.Option(None, "--rows", "-n"),
+    overwrite: bool = typer.Option(False, "--overwrite"),
+    major_shard_workers: int | None = typer.Option(None, "--major-shard-workers"),
+    sub_shard_workers: int | None = typer.Option(None, "--sub-shard-workers"),
+    sub_major_workers: int | None = typer.Option(None, "--sub-major-workers"),
 ) -> None:
-    """Run full pipeline: Major → SetFit."""
+    """Run full pipeline using `predict.major_input_*` then `predict.sub_input_*`."""
     from trainer.src.pipelines.predict import run as predict_run
 
-    predict_run(limit_rows=rows)
+    predict_run(
+        limit_rows=rows,
+        overwrite=overwrite,
+        major_shard_workers=major_shard_workers,
+        sub_shard_workers=sub_shard_workers,
+        sub_major_workers=sub_major_workers,
+    )
 
 
 @predict_app.command("major")
@@ -225,12 +242,24 @@ def predict_all(
 def predict_major(
     ctx: typer.Context,
     rows: int | None = typer.Option(None, "--rows", "-n"),
+    overwrite: bool = typer.Option(False, "--overwrite"),
+    major_shard_workers: int | None = typer.Option(None, "--major-shard-workers"),
 ) -> None:
-    """Phase 1: Major inference → intermediate parquet."""
-    from trainer.src.pipelines.predict import run_finbert
+    """Phase 1: Major inference → intermediate parquet.
 
-    path = run_finbert(limit_rows=rows)
-    console.print(f"[bold green]Major intermediate saved to: {path}[/bold green]")
+    Reads:
+        `predict.major_input_dir` or `predict.major_input_path(s)`
+
+    Writes:
+        `predict.major_output_dir` or `predict.major_output_path`
+
+    Example:
+        python -m trainer.main predict major
+    """
+    from trainer.src.pipelines.predict import run_major
+
+    paths = run_major(limit_rows=rows, overwrite=overwrite, shard_workers=major_shard_workers)
+    console.print(f"[bold green]Major intermediate saved to: {paths}[/bold green]")
 
 
 @predict_app.command("sub")
@@ -238,11 +267,30 @@ def predict_major(
 def predict_sub(
     ctx: typer.Context,
     rows: int | None = typer.Option(None, "--rows", "-n"),
+    overwrite: bool = typer.Option(False, "--overwrite"),
+    sub_shard_workers: int | None = typer.Option(None, "--sub-shard-workers"),
+    sub_major_workers: int | None = typer.Option(None, "--sub-major-workers"),
 ) -> None:
-    """Phase 2: sub-category classification on Major intermediate."""
-    from trainer.src.pipelines.predict import run_setfit
+    """Phase 2: sub-category classification on Major intermediate.
 
-    run_setfit(limit_rows=rows)
+    Reads:
+        `predict.sub_input_dir` or `predict.sub_input_path(s)`
+        Falls back to `predict.major_output_dir` only when sub input is not explicitly configured.
+
+    Writes:
+        `predict.output_dir` or `predict.output_path`
+
+    Example:
+        python -m trainer.main predict sub --sub-shard-workers 4 --sub-major-workers 8
+    """
+    from trainer.src.pipelines.predict import run_sub
+
+    run_sub(
+        limit_rows=rows,
+        overwrite=overwrite,
+        shard_workers=sub_shard_workers,
+        sub_major_workers=sub_major_workers,
+    )
 
 
 # ── Signals subapp ────────────────────────────────────────────────────────────
