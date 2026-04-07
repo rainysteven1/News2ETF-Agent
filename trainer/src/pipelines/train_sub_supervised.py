@@ -11,6 +11,7 @@ from __future__ import annotations
 import gc
 import json
 import time
+import traceback
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -28,7 +29,7 @@ from transformers.optimization import get_linear_schedule_with_warmup
 
 from trainer.src.config import LabelStats, get_config, safe_name
 from trainer.src.datasets.sub import SubCatDataset, preprocess_split
-from trainer.src.models.sub import SubClassifier, load_sub_classifier
+from trainer.src.models.sub import SubClassifier, load_sub_classifier, save_sub_classifier
 from trainer.src.utils import WandbRegistry, get_logger
 
 
@@ -138,6 +139,7 @@ class SupervisedMultiMajorTrainer:
                 results[major] = result
             except Exception as e:
                 self.logger.error(f"[Sub] [Supervised] Failed to train {major}: {e}")
+                self.logger.error(traceback.format_exc())
                 continue
 
         summary_path = Path(self.tcfg.output_dir) / f"{run_prefix}.json"
@@ -264,7 +266,7 @@ class SupervisedMultiMajorTrainer:
             if val_metrics.accuracy > best_val_acc:
                 best_val_acc = val_metrics.accuracy
                 if self.tcfg.save_checkpoint:
-                    model.save_pretrained(output_dir / "best")
+                    save_sub_classifier(model, output_dir / "best")
                     tokenizer.save_pretrained(output_dir / "best")
                 epochs_without_improvement = 0
             else:
@@ -356,7 +358,7 @@ class SupervisedMultiMajorTrainer:
                 if val_metrics._y_true and val_metrics._y_pred:
                     cm = build_confusion_matrix(val_metrics._y_true, val_metrics._y_pred, num_classes)
                 if self.tcfg.save_checkpoint:
-                    model.save_pretrained(output_dir / "best")
+                    save_sub_classifier(model, output_dir / "best")
                     tokenizer.save_pretrained(output_dir / "best")
                 epochs_without_improvement = 0
             else:
@@ -384,7 +386,7 @@ class SupervisedMultiMajorTrainer:
 
         if self.tcfg.save_checkpoint:
             best_dir = output_dir / "best"
-            model.save_pretrained(best_dir)
+            save_sub_classifier(model, best_dir)
             results["model_dir"] = str(best_dir)
             self.logger.info(f"[Supervised] {major} best model saved to {best_dir} (accuracy={best_val_acc:.4f})")
 

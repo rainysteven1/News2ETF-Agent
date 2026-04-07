@@ -4,7 +4,7 @@ seed = 42
 
 [wandb]
 mode = "online"
-project = "news2etf-agent"
+project = "News2ETF-Agent-Tools"
 entity = "rainysteven_team"
 
 [major.data]
@@ -132,7 +132,7 @@ output_checkpoint = "./trainer/checkpoints/signals"
 # Phase 1 major prediction:
 #   - reads raw news parquet shards from major_input_dir / major_input_glob
 #   - writes major-labeled parquet shards into major_output_dir
-major_onnx_dir = "./trainer/checkpoints/finbert/finbert-0403-1329"
+major_onnx_dir = "./trainer/models/major"
 major_output_dir = "./trainer/data/labeled/signals/major_only"
 major_workers = 1
 major_shard_workers = 2
@@ -143,12 +143,12 @@ major_input_glob = "*.parquet"
 #   - reads explicitly from sub_input_dir / sub_input_glob
 #   - falls back to major_output_dir only if sub_input_* is not configured
 #   - writes final labeled parquet shards into output_dir
-sub_backend = "setfit"
-sub_onnx_dir = "./trainer/checkpoints/setfit"
+sub_backend = "supervised"
+sub_onnx_dir = "./trainer/models/sub/0407-1415"
 sub_shard_workers = 4
 sub_major_workers = 8
 sub_input_dir = "./trainer/data/labeled/signals/major_only"
-sub_input_glob = "*_major_only.parquet"
+sub_input_glob = "raw.parquet"
 output_dir = "./trainer/data/labeled/signals/raw"
 batch_size = 256
 major_max_length = 128

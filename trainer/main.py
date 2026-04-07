@@ -188,9 +188,9 @@ def supervised_train(
     majors: list[str] = typer.Argument(None, help="Specific major categories (default: all)"),
 ) -> None:
     """Train sub-category classifiers (supervised fine-tune) per major."""
-    from trainer.src.pipelines.train_sub_supervised import SubMultiMajorTrainer
+    from trainer.src.pipelines.train_sub_supervised import SupervisedMultiMajorTrainer
 
-    SubMultiMajorTrainer(get_config().sub, device).train(majors=majors)
+    SupervisedMultiMajorTrainer(device).train(majors=majors)
 
 
 @supervised_app.command("export-onnx")

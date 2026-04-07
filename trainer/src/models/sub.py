@@ -152,6 +152,21 @@ def load_sub_classifier(
     return model  # type: ignore
 
 
+def save_sub_classifier(model: SubClassifier, output_dir: Path) -> None:
+    """Save checkpoint without calling `save_pretrained()`.
+
+    `transformers.save_pretrained()` may import DeepSpeed via accelerate when
+    unwrapping the model, which breaks in some environments with numpy>=2.
+    For this model, writing `config.json` and `pytorch_model.bin` is sufficient
+    for `SubClassifier.from_pretrained(...)` to load it back.
+    """
+    output_dir.mkdir(parents=True, exist_ok=True)
+    model_to_save = model.module if hasattr(model, "module") else model
+    model_to_save.config.save_pretrained(output_dir)
+    state_dict = {k: v.detach().cpu() for k, v in model_to_save.state_dict().items()}
+    torch.save(state_dict, output_dir / "pytorch_model.bin")
+
+
 def export_sub_to_onnx(
     model_dir: Path,
     onnx_path: Path,
