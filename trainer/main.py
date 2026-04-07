@@ -224,6 +224,8 @@ def predict_all(
     major_shard_workers: int | None = typer.Option(None, "--major-shard-workers"),
     sub_shard_workers: int | None = typer.Option(None, "--sub-shard-workers"),
     sub_major_workers: int | None = typer.Option(None, "--sub-major-workers"),
+    start_month: str | None = typer.Option(None, "--start-month", help="Inclusive YYYY-MM filter for sub inference."),
+    end_month: str | None = typer.Option(None, "--end-month", help="Inclusive YYYY-MM filter for sub inference."),
 ) -> None:
     """Run full pipeline using `predict.major_input_*` then `predict.sub_input_*`."""
     from trainer.src.pipelines.predict import run as predict_run
@@ -234,6 +236,8 @@ def predict_all(
         major_shard_workers=major_shard_workers,
         sub_shard_workers=sub_shard_workers,
         sub_major_workers=sub_major_workers,
+        start_month=start_month,
+        end_month=end_month,
     )
 
 
@@ -270,6 +274,8 @@ def predict_sub(
     overwrite: bool = typer.Option(False, "--overwrite"),
     sub_shard_workers: int | None = typer.Option(None, "--sub-shard-workers"),
     sub_major_workers: int | None = typer.Option(None, "--sub-major-workers"),
+    start_month: str | None = typer.Option(None, "--start-month", help="Inclusive YYYY-MM filter for sub inference."),
+    end_month: str | None = typer.Option(None, "--end-month", help="Inclusive YYYY-MM filter for sub inference."),
 ) -> None:
     """Phase 2: sub-category classification on Major intermediate.
 
@@ -290,6 +296,8 @@ def predict_sub(
         overwrite=overwrite,
         shard_workers=sub_shard_workers,
         sub_major_workers=sub_major_workers,
+        start_month=start_month,
+        end_month=end_month,
     )
 
 

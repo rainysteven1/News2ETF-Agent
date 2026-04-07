@@ -129,6 +129,11 @@ anomaly_threshold = 0.03
 output_checkpoint = "./trainer/checkpoints/signals"
 
 [predict]
+# Set to true when the machine has a usable accelerator visible to PyTorch,
+# but ONNX Runtime does not expose CUDAExecutionProvider.
+# This only affects scheduler heuristics/logging; it does not change ORT providers.
+assume_accelerated_device = false
+
 # Phase 1 major prediction:
 #   - reads raw news parquet shards from major_input_dir / major_input_glob
 #   - writes major-labeled parquet shards into major_output_dir

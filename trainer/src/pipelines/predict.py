@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -70,6 +71,64 @@ def _has_cuda_ort_provider() -> bool:
         return "CUDAExecutionProvider" in ort.get_available_providers()
     except Exception:
         return False
+
+
+def _ort_available_providers() -> list[str]:
+    try:
+        return list(ort.get_available_providers())
+    except Exception:
+        return []
+
+
+def _torch_accelerator_name() -> str | None:
+    try:
+        import torch
+    except Exception:
+        return None
+
+    try:
+        if torch.cuda.is_available():
+            return "cuda"
+    except Exception:
+        pass
+
+    mps = getattr(torch.backends, "mps", None)
+    try:
+        if mps is not None and mps.is_available():
+            return "mps"
+    except Exception:
+        pass
+
+    xpu = getattr(torch, "xpu", None)
+    try:
+        if xpu is not None and xpu.is_available():
+            return "xpu"
+    except Exception:
+        pass
+
+    npu = getattr(torch, "npu", None)
+    try:
+        if npu is not None and npu.is_available():
+            return "npu"
+    except Exception:
+        pass
+
+    return None
+
+
+def _runtime_device_state(force_accelerated: bool = False) -> dict[str, str | bool]:
+    ort_providers = _ort_available_providers()
+    torch_accelerator = _torch_accelerator_name()
+    ort_cuda_provider = "CUDAExecutionProvider" in ort_providers
+    accelerated = ort_cuda_provider or force_accelerated
+    reason = "ort_cuda_provider" if ort_cuda_provider else ("config_override" if force_accelerated else "cpu_only")
+    return {
+        "ort_cuda_provider": ort_cuda_provider,
+        "ort_providers": ",".join(ort_providers) if ort_providers else "none",
+        "torch_accelerator": torch_accelerator or "none",
+        "accelerated": accelerated,
+        "reason": reason,
+    }
 
 
 def _softmax(logits: np.ndarray) -> np.ndarray:
@@ -246,6 +305,28 @@ def _should_log_heartbeat(
     return _should_log_progress(current_batch, total_batches) or (now - last_log_at) >= min_interval_seconds
 
 
+def _sub_stream_chunk_rows(batch_size: int) -> int:
+    # Keep parquet streaming chunks much larger than model batches so we do not
+    # pay grouping/scheduling/write overhead every ~1k rows.
+    return max(8192, batch_size * 16)
+
+
+def _normalize_month_filter(month: str | None, option_name: str) -> str | None:
+    if month is None:
+        return None
+    if not re.fullmatch(r"\d{4}-\d{2}", month):
+        raise ValueError(f"{option_name} must be in YYYY-MM format, got: {month}")
+    return month
+
+
+def _month_in_range(month_key: str, start_month: str | None, end_month: str | None) -> bool:
+    if start_month is not None and month_key < start_month:
+        return False
+    if end_month is not None and month_key > end_month:
+        return False
+    return True
+
+
 def _build_major_batch_texts(batch_df: pl.DataFrame) -> list[str]:
     texts: list[str] = []
     for row in batch_df.iter_rows(named=True):
@@ -293,6 +374,9 @@ def _load_sub_labels(
     if label_map_path.exists():
         with open(label_map_path, encoding="utf-8") as f:
             label_map = json.load(f)
+        if isinstance(label_map, list):
+            # setfit format: plain list of labels
+            return label_map
         idx_to_label = label_map.get("idx_to_label", {})
         if idx_to_label:
             return [idx_to_label[str(i)] for i in range(len(idx_to_label))]
@@ -333,6 +417,56 @@ def _log_sub_model_layout(resolved_model_dirs: dict[str, tuple[str, Path]], majo
         safe = safe_name(major)
         backend_name, model_dir = resolved_model_dirs[safe]
         logger.info(f"[Sub/{backend_name}] major={major} | dir={model_dir}")
+
+
+def _month_checkpoint_dir(output_path: Path) -> Path:
+    return output_path.parent / f".{output_path.stem}_monthly_checkpoints"
+
+
+def _month_checkpoint_path(checkpoint_dir: Path, month_key: str) -> Path:
+    return checkpoint_dir / f"{month_key}.parquet"
+
+
+def _collect_month_keys(df: pl.DataFrame) -> list[str]:
+    months = (
+        df.select(pl.col("datetime").cast(pl.Utf8).str.slice(0, 7).alias("month_key"))
+        .get_column("month_key")
+        .unique(maintain_order=True)
+        .to_list()
+    )
+    return [m for m in months if m]
+
+
+def _slice_month_df(df: pl.DataFrame, month_key: str) -> pl.DataFrame:
+    return df.filter(pl.col("datetime").cast(pl.Utf8).str.slice(0, 7) == month_key)
+
+
+def _merge_month_checkpoints(output_path: Path, checkpoint_dir: Path, month_keys: list[str]) -> None:
+    month_paths = [_month_checkpoint_path(checkpoint_dir, month_key) for month_key in month_keys]
+    parts = [pl.read_parquet(path) for path in month_paths if path.exists()]
+    if not parts:
+        raise RuntimeError(f"No monthly checkpoint files found to merge under {checkpoint_dir}")
+    merged = pl.concat(parts, how="vertical")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    merged.write_parquet(output_path)
+
+
+def _append_month_part(month_parts: list[pl.DataFrame], month_df: pl.DataFrame) -> None:
+    if not month_df.is_empty():
+        month_parts.append(month_df.drop("month_key") if "month_key" in month_df.columns else month_df)
+
+
+def _append_parquet_chunk(
+    writer: pq.ParquetWriter | None,
+    output_path: Path,
+    df: pl.DataFrame,
+) -> pq.ParquetWriter:
+    table = df.to_arrow()
+    if writer is None:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        writer = pq.ParquetWriter(output_path, table.schema)
+    writer.write_table(table)
+    return writer
 
 
 def _filter_major_batch_rows(batch_dict: dict[str, list[object]]) -> tuple[dict[str, list[object]], list[str], int]:
@@ -535,6 +669,7 @@ def run_major(
     assert p.major_onnx_dir is not None, "major_onnx_dir must be set in config.toml"
 
     total_inputs = len(input_paths)
+    runtime_state = _runtime_device_state(force_accelerated=p.assume_accelerated_device)
     outputs: list[Path] = []
     pending_jobs: list[tuple[Path, Path]] = []
     for input_path in input_paths:
@@ -549,7 +684,10 @@ def run_major(
     workers = _effective_parallelism(requested_shard_workers, len(pending_jobs))
     logger.info(
         f"[Major] Effective parallelism | "
-        f"cuda_provider={_has_cuda_ort_provider()} | "
+        f"accelerated={runtime_state['accelerated']} ({runtime_state['reason']}) | "
+        f"ort_cuda_provider={runtime_state['ort_cuda_provider']} | "
+        f"ort_providers={runtime_state['ort_providers']} | "
+        f"torch_accelerator={runtime_state['torch_accelerator']} | "
         f"shard_workers={workers} | "
         f"major_workers={p.major_workers} | "
         f"major_batch_size={p.major_batch_size} | "
@@ -592,83 +730,27 @@ def run_major(
     return outputs
 
 
-def _run_sub_single(
-    intermediate_path: Path,
-    output_path: Path,
-    sub_onnx_dir: Path,
+def _classify_sub_dataframe(
+    df: pl.DataFrame,
+    *,
     batch_size: int,
     sub_max_length: int,
     sub_major_workers: int,
-    shard_workers: int,
-    limit_rows: int | None = None,
-) -> Path:
-    """Run sub-category classification on one Major intermediate shard."""
-    logger.info(f"[Sub] Loading Major intermediate: {intermediate_path}")
-    df = pl.read_parquet(intermediate_path)
-    logger.info(f"[Sub] Intermediate parquet loaded: {intermediate_path} | rows={len(df)}")
-
-    if limit_rows is not None:
-        df = df.head(limit_rows)
-        logger.info(f"[Sub] Applied row limit: {limit_rows}")
-
+    sub_sessions: dict[str, ort.InferenceSession],
+    sub_tokenizers: dict[str, AutoTokenizer],
+    sub_labels_by_major: dict[str, list[str]],
+    backend_by_major: dict[str, str],
+    subcats_lookup: dict[str, list[str]],
+) -> pl.DataFrame:
     n = len(df)
     logger.info(f"[Sub] {n} rows to classify")
-
-    cpu_count = os.cpu_count() or 1
-    intra_threads, inter_threads = _resolve_ort_threads(cpu_count, shard_workers)
-    logger.info(f"[Sub] CPU cores={cpu_count}, ORT threads: intra={intra_threads}, inter={inter_threads}")
 
     logger.info(f"[Sub] Grouping rows by major category")
     safe_to_global_idx, safe_to_texts = _build_sub_groups(df)
     logger.info(f"[Sub] Grouping complete: {len(safe_to_global_idx)} major buckets")
 
-    label_stats = LabelStats.load()
-    major_categories = label_stats.get_major_categories()
-    major_to_subcats: dict[str, list[str]] = {m: label_stats.get_sub_categories(m) for m in major_categories}
-    subcats_lookup = {
-        **{k: v for k, v in major_to_subcats.items()},
-        **{safe_name(k): v for k, v in major_to_subcats.items()},
-    }
-
-    sub_sessions: dict[str, ort.InferenceSession] = {}
-    sub_tokenizers: dict[str, AutoTokenizer] = {}
-    sub_labels_by_major: dict[str, list[str]] = {}
-    backend_by_major: dict[str, str] = {}
-
-    assert sub_onnx_dir is not None, "sub_onnx_dir must be set in config.toml"
-    major_model_dirs = _discover_sub_model_dirs(sub_onnx_dir, major_categories)
-
-    present_safes = sorted(safe_to_global_idx.keys())
-    logger.info(f"[Sub] Loading models only for majors in shard: {present_safes}")
-
-    for safe in present_safes:
-        if safe not in major_model_dirs:
-            logger.warning(f"[Sub] Major '{safe}' not found in validated model directory map, will use fallback '其他'")
-            continue
-        backend_name, major_dir = major_model_dirs[safe]
-        onnx_path = major_dir / "best.onnx"
-        tokenizer_path = major_dir / "tokenizer"
-        label_map_path = major_dir / "label_map.json"
-
-        if not onnx_path.exists() or not tokenizer_path.exists():
-            logger.warning(
-                f"[Sub/{backend_name}] ONNX/tokenizer not found for '{safe}' in {major_dir}, will use fallback '其他'"
-            )
-            continue
-
-        logger.info(f"[Sub/{backend_name}] Loading ONNX for '{safe}' from {major_dir}")
-        sub_sessions[safe] = _make_ort_session(onnx_path, intra_threads, inter_threads)
-        sub_tokenizers[safe] = AutoTokenizer.from_pretrained(str(tokenizer_path))
-        sub_labels_by_major[safe] = _load_sub_labels(safe, label_map_path, subcats_lookup)
-        backend_by_major[safe] = backend_name
-
-    if not sub_sessions:
-        raise RuntimeError(f"No sub ONNX models loaded from sub_onnx_dir={sub_onnx_dir}")
-    logger.info(f"[Sub] Loaded {len(sub_sessions)} per-major ONNX models for this shard")
-
     sub_cats_out = np.full(n, "其他", dtype=object)
     sub_confs_out = np.zeros(n, dtype=np.float64)
-
     t0 = time.monotonic()
 
     with ThreadPoolExecutor(max_workers=_effective_parallelism(sub_major_workers, len(safe_to_global_idx))) as executor:
@@ -742,13 +824,175 @@ def _run_sub_single(
                 f" | rows={len(results)} | {elapsed:.1f}s total"
             )
 
-    result_df = df.with_columns(
+    return df.with_columns(
         pl.Series("sub_category", sub_cats_out),
         pl.Series("sub_category_confidence", sub_confs_out),
     )
 
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    result_df.write_parquet(output_path)
+
+def _run_sub_single(
+    intermediate_path: Path,
+    output_path: Path,
+    sub_onnx_dir: Path,
+    batch_size: int,
+    sub_max_length: int,
+    sub_major_workers: int,
+    shard_workers: int,
+    limit_rows: int | None = None,
+    overwrite: bool = False,
+    start_month: str | None = None,
+    end_month: str | None = None,
+) -> Path:
+    """Run sub-category classification on one Major intermediate shard with monthly checkpoints."""
+    logger.info(f"[Sub] Loading Major intermediate: {intermediate_path}")
+    parquet_file = pq.ParquetFile(intermediate_path)
+    total_rows = parquet_file.metadata.num_rows
+    logger.info(f"[Sub] Intermediate parquet opened: {intermediate_path} | rows={total_rows}")
+    if start_month is not None or end_month is not None:
+        logger.info(f"[Sub] Applying month filter | start={start_month or '-'} | end={end_month or '-'}")
+
+    row_budget = limit_rows if limit_rows is not None else total_rows
+    if limit_rows is not None:
+        logger.info(f"[Sub] Applied row limit: {limit_rows}")
+
+    major_categories = LabelStats.load().get_major_categories()
+    major_model_dirs = _discover_sub_model_dirs(sub_onnx_dir, major_categories)
+    major_to_subcats: dict[str, list[str]] = {m: LabelStats.load().get_sub_categories(m) for m in major_categories}
+    subcats_lookup = {
+        **{k: v for k, v in major_to_subcats.items()},
+        **{safe_name(k): v for k, v in major_to_subcats.items()},
+    }
+
+    cpu_count = os.cpu_count() or 1
+    intra_threads, inter_threads = _resolve_ort_threads(cpu_count, shard_workers)
+    logger.info(f"[Sub] CPU cores={cpu_count}, ORT threads: intra={intra_threads}, inter={inter_threads}")
+
+    sub_sessions: dict[str, ort.InferenceSession] = {}
+    sub_tokenizers: dict[str, AutoTokenizer] = {}
+    sub_labels_by_major: dict[str, list[str]] = {}
+    backend_by_major: dict[str, str] = {}
+    logger.info(f"[Sub] Preloading per-major ONNX models once for this shard")
+    for safe, (backend_name, major_dir) in major_model_dirs.items():
+        onnx_path = major_dir / "best.onnx"
+        tokenizer_path = major_dir / "tokenizer"
+        label_map_path = major_dir / "label_map.json"
+        if not onnx_path.exists() or not tokenizer_path.exists():
+            logger.warning(
+                f"[Sub/{backend_name}] ONNX/tokenizer not found for '{safe}' in {major_dir}, skipping preload"
+            )
+            continue
+        sub_sessions[safe] = _make_ort_session(onnx_path, intra_threads, inter_threads)
+        sub_tokenizers[safe] = AutoTokenizer.from_pretrained(str(tokenizer_path))
+        sub_labels_by_major[safe] = _load_sub_labels(safe, label_map_path, subcats_lookup)
+        backend_by_major[safe] = backend_name
+
+    if not sub_sessions:
+        raise RuntimeError(f"No sub ONNX models loaded from sub_onnx_dir={sub_onnx_dir}")
+    logger.info(f"[Sub] Preloaded {len(sub_sessions)} per-major ONNX models for this shard")
+
+    checkpoint_dir = _month_checkpoint_dir(output_path)
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    stream_chunk_rows = _sub_stream_chunk_rows(batch_size)
+    processed_input_rows = 0
+    current_month: str | None = None
+    seen_months: list[str] = []
+    current_month_path: Path | None = None
+    current_month_writer: pq.ParquetWriter | None = None
+    current_month_skipped = False
+    current_month_started_at: float | None = None
+    current_month_written_rows = 0
+
+    def close_current_month_writer() -> None:
+        nonlocal current_month_writer
+        if current_month_writer is not None:
+            current_month_writer.close()
+            current_month_writer = None
+
+    def finalize_current_month() -> None:
+        nonlocal current_month_started_at, current_month_written_rows
+        close_current_month_writer()
+        if current_month is None or current_month_skipped or current_month_started_at is None:
+            return
+        elapsed = time.monotonic() - current_month_started_at
+        assert current_month_path is not None
+        logger.info(
+            f"[Sub] Month complete {current_month}"
+            f" | rows={current_month_written_rows}"
+            f" | {elapsed:.1f}s total"
+            f" | output={current_month_path}"
+        )
+        current_month_started_at = None
+        current_month_written_rows = 0
+
+    for batch in parquet_file.iter_batches(batch_size=stream_chunk_rows):
+        if processed_input_rows >= row_budget:
+            break
+        batch_df = pl.from_arrow(batch)
+        if processed_input_rows + len(batch_df) > row_budget:
+            batch_df = batch_df.head(row_budget - processed_input_rows)
+        processed_input_rows += len(batch_df)
+        if batch_df.is_empty():
+            continue
+
+        batch_df = batch_df.with_columns(pl.col("datetime").cast(pl.Utf8).str.slice(0, 7).alias("month_key"))
+        for part in batch_df.partition_by("month_key", maintain_order=True):
+            month_key = part.item(0, "month_key")
+            if not month_key:
+                continue
+            if end_month is not None and month_key > end_month:
+                finalize_current_month()
+                logger.info(f"[Sub] Reached end_month={end_month}; stopping stream at month {month_key}")
+                _merge_month_checkpoints(output_path, checkpoint_dir, seen_months)
+                logger.success(f"[Sub] Complete output → {output_path}")
+                return output_path
+            if not _month_in_range(month_key, start_month, end_month):
+                if start_month is not None and month_key < start_month:
+                    logger.info(f"[Sub] Skip month {month_key} before start_month={start_month}")
+                continue
+            if month_key not in seen_months:
+                seen_months.append(month_key)
+            if current_month is None:
+                current_month = month_key
+                current_month_path = _month_checkpoint_path(checkpoint_dir, current_month)
+                current_month_skipped = current_month_path.exists() and not overwrite
+                current_month_started_at = None if current_month_skipped else time.monotonic()
+                current_month_written_rows = 0
+                logger.info(f"[Sub] Enter month {current_month}")
+                if current_month_skipped:
+                    logger.info(f"[Sub] Skip completed month {current_month} -> {current_month_path}")
+            if month_key != current_month:
+                finalize_current_month()
+                current_month = month_key
+                current_month_path = _month_checkpoint_path(checkpoint_dir, current_month)
+                current_month_skipped = current_month_path.exists() and not overwrite
+                current_month_started_at = None if current_month_skipped else time.monotonic()
+                current_month_written_rows = 0
+                logger.info(f"[Sub] Enter month {current_month}")
+                if current_month_skipped:
+                    logger.info(f"[Sub] Skip completed month {current_month} -> {current_month_path}")
+            if current_month_skipped:
+                continue
+
+            month_df = part.drop("month_key")
+            logger.info(f"[Sub] Processing month {month_key} chunk | rows={len(month_df)}")
+            result_df = _classify_sub_dataframe(
+                month_df,
+                batch_size=batch_size,
+                sub_max_length=sub_max_length,
+                sub_major_workers=sub_major_workers,
+                sub_sessions=sub_sessions,
+                sub_tokenizers=sub_tokenizers,
+                sub_labels_by_major=sub_labels_by_major,
+                backend_by_major=backend_by_major,
+                subcats_lookup=subcats_lookup,
+            )
+            assert current_month_path is not None
+            current_month_writer = _append_parquet_chunk(current_month_writer, current_month_path, result_df)
+            current_month_written_rows += len(result_df)
+
+    finalize_current_month()
+
+    _merge_month_checkpoints(output_path, checkpoint_dir, seen_months)
     logger.success(f"[Sub] Complete output → {output_path}")
     return output_path
 
@@ -758,10 +1002,16 @@ def run_sub(
     overwrite: bool = False,
     shard_workers: int | None = None,
     sub_major_workers: int | None = None,
+    start_month: str | None = None,
+    end_month: str | None = None,
 ) -> list[Path]:
     """Run sub-category classification shard-by-shard and return final output paths."""
     cfg = load_config()
     p = cfg.prediction
+    start_month = _normalize_month_filter(start_month, "start_month")
+    end_month = _normalize_month_filter(end_month, "end_month")
+    if start_month is not None and end_month is not None and start_month > end_month:
+        raise ValueError(f"start_month must be <= end_month, got {start_month} > {end_month}")
 
     intermediate_paths = _get_sub_input_paths(p)
     assert intermediate_paths, "No sub input parquet files found in configured source"
@@ -772,6 +1022,7 @@ def run_sub(
     _log_sub_model_layout(resolved_model_dirs, major_categories)
 
     total_inputs = len(intermediate_paths)
+    runtime_state = _runtime_device_state(force_accelerated=p.assume_accelerated_device)
     outputs: list[Path] = []
     pending_jobs: list[tuple[Path, Path]] = []
     for intermediate_path in intermediate_paths:
@@ -783,25 +1034,29 @@ def run_sub(
         pending_jobs.append((intermediate_path, output_path))
 
     requested_sub_major_workers = sub_major_workers if sub_major_workers is not None else p.sub_major_workers
-    cuda_provider_enabled = _has_cuda_ort_provider()
-
     requested_shard_workers = shard_workers if shard_workers is not None else p.sub_shard_workers
-    if shard_workers is None and cuda_provider_enabled:
+    if shard_workers is None and runtime_state["accelerated"]:
         if requested_shard_workers != 1:
             logger.info(
-                f"[Sub] CUDAExecutionProvider detected; "
+                f"[Sub] Accelerated device detected via {runtime_state['reason']}; "
                 f"defaulting sub shard workers from {requested_shard_workers} to 1 for single-GPU efficiency"
             )
         requested_shard_workers = 1
     workers = _effective_parallelism(requested_shard_workers, len(pending_jobs))
     logger.info(
         f"[Sub] Effective parallelism | "
-        f"cuda_provider={cuda_provider_enabled} | "
+        f"accelerated={runtime_state['accelerated']} ({runtime_state['reason']}) | "
+        f"ort_cuda_provider={runtime_state['ort_cuda_provider']} | "
+        f"ort_providers={runtime_state['ort_providers']} | "
+        f"torch_accelerator={runtime_state['torch_accelerator']} | "
         f"shard_workers={workers} | "
         f"sub_major_workers={requested_sub_major_workers} | "
         f"sub_batch_size={p.sub_batch_size} | "
+        f"sub_stream_chunk_rows={_sub_stream_chunk_rows(p.sub_batch_size)} | "
         f"pending_shards={len(pending_jobs)}"
     )
+    if start_month is not None or end_month is not None:
+        logger.info(f"[Sub] Effective month filter | start={start_month or '-'} | end={end_month or '-'}")
     if pending_jobs and workers > 1:
         logger.info(f"[Sub] Running {len(pending_jobs)} shards with {workers} processes")
         with ProcessPoolExecutor(max_workers=workers) as executor:
@@ -816,6 +1071,9 @@ def run_sub(
                     requested_sub_major_workers,
                     workers,
                     limit_rows,
+                    overwrite,
+                    start_month,
+                    end_month,
                 ): output_path
                 for intermediate_path, output_path in pending_jobs
             }
@@ -824,15 +1082,18 @@ def run_sub(
     else:
         for intermediate_path, output_path in pending_jobs:
             outputs.append(
-                    _run_sub_single(
-                        intermediate_path=intermediate_path,
-                        output_path=output_path,
-                        sub_onnx_dir=p.sub_onnx_dir,
-                        batch_size=p.sub_batch_size,
-                        sub_max_length=p.sub_max_length,
-                        sub_major_workers=requested_sub_major_workers,
-                        shard_workers=workers,
-                        limit_rows=limit_rows,
+                _run_sub_single(
+                    intermediate_path=intermediate_path,
+                    output_path=output_path,
+                    sub_onnx_dir=p.sub_onnx_dir,
+                    batch_size=p.sub_batch_size,
+                    sub_max_length=p.sub_max_length,
+                    sub_major_workers=requested_sub_major_workers,
+                    shard_workers=workers,
+                    limit_rows=limit_rows,
+                    overwrite=overwrite,
+                    start_month=start_month,
+                    end_month=end_month,
                 )
             )
     outputs.sort()
@@ -845,6 +1106,8 @@ def run(
     major_shard_workers: int | None = None,
     sub_shard_workers: int | None = None,
     sub_major_workers: int | None = None,
+    start_month: str | None = None,
+    end_month: str | None = None,
 ) -> None:
     """Run full pipeline shard-by-shard: Major → sub-category classification."""
     logger.info("[Predict] === Phase 1: Major ===")
@@ -856,6 +1119,8 @@ def run(
         overwrite=overwrite,
         shard_workers=sub_shard_workers,
         sub_major_workers=sub_major_workers,
+        start_month=start_month,
+        end_month=end_month,
     )
 
     logger.info("[Predict] === All done ===")

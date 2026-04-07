@@ -23,6 +23,7 @@ class PredictionConfig(BaseModel):
     major_onnx_dir: Path | None = None
     major_output_path: Path | None = None
     major_output_dir: Path | None = None
+    assume_accelerated_device: bool = False
     major_workers: int = 8
     major_shard_workers: int = 4
     major_input_dir: Path | None = None
