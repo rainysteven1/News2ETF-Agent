@@ -79,6 +79,7 @@ class SubClassifier(BertPreTrainedModel):
         hidden = config.hidden_size
         drop = config.classifier_dropout
 
+        drop = drop if drop is not None else 0.1
         self.dropout = nn.Dropout(drop)
         self.fc1 = nn.Linear(hidden, hidden // 2)
         self.activation = nn.GELU()

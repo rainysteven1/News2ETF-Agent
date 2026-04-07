@@ -132,7 +132,7 @@ output_checkpoint = "./trainer/checkpoints/signals"
 # Phase 1 major prediction:
 #   - reads raw news parquet shards from major_input_dir / major_input_glob
 #   - writes major-labeled parquet shards into major_output_dir
-major_onnx_dir = "./trainer/checkpoints/major"
+major_onnx_dir = "./trainer/checkpoints/finbert/finbert-0403-1329"
 major_output_dir = "./trainer/data/labeled/signals/major_only"
 major_workers = 1
 major_shard_workers = 2

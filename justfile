@@ -33,7 +33,8 @@ signals-train:
 # Major defaults are taken from trainer/config.toml:
 #   - major_shard_workers = 2
 #   - major_workers = 1
-#   - batch_size = 256
+
+# - batch_size = 256
 predict-major:
     ./.venv/bin/python -m trainer.main predict major
 
@@ -42,7 +43,8 @@ predict-major-overwrite:
 
 # 64-core recommendation for sub:
 #   - 4 shard processes
-#   - 8 per-major workers inside each shard
+
+# - 8 per-major workers inside each shard
 predict-sub:
     ./.venv/bin/python -m trainer.main predict sub --sub-shard-workers 4 --sub-major-workers 8
 

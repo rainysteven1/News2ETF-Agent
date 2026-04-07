@@ -64,7 +64,7 @@ class MajorClassifier(BertPreTrainedModel):
         super().__init__(config)
         self.bert = BertModel(config, add_pooling_layer=True)
         hidden = config.hidden_size
-        drop = config.classifier_dropout
+        drop = config.classifier_dropout if config.classifier_dropout is not None else 0.1
 
         self.dropout = nn.Dropout(drop)
 
