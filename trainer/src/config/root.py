@@ -42,7 +42,8 @@ class PredictionConfig(BaseModel):
     input_paths: list[Path] | None = None
     output_path: Path | None = None
     output_dir: Path | None = None
-    batch_size: int = 64
+    major_batch_size: int = 64
+    sub_batch_size: int = 256
     major_max_length: int = 128
     sub_max_length: int = 256
 

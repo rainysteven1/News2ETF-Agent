@@ -552,6 +552,7 @@ def run_major(
         f"cuda_provider={_has_cuda_ort_provider()} | "
         f"shard_workers={workers} | "
         f"major_workers={p.major_workers} | "
+        f"major_batch_size={p.major_batch_size} | "
         f"pending_shards={len(pending_jobs)}"
     )
     if pending_jobs and workers > 1:
@@ -565,7 +566,7 @@ def run_major(
                     p.major_onnx_dir,
                     p.major_workers,
                     workers,
-                    p.batch_size,
+                    p.major_batch_size,
                     p.major_max_length,
                     limit_rows,
                 ): output_path
@@ -582,7 +583,7 @@ def run_major(
                     major_onnx_dir=p.major_onnx_dir,
                     major_workers=p.major_workers,
                     shard_workers=workers,
-                    batch_size=p.batch_size,
+                    batch_size=p.major_batch_size,
                     major_max_length=p.major_max_length,
                     limit_rows=limit_rows,
                 )
@@ -595,6 +596,7 @@ def _run_sub_single(
     intermediate_path: Path,
     output_path: Path,
     sub_onnx_dir: Path,
+    batch_size: int,
     sub_max_length: int,
     sub_major_workers: int,
     shard_workers: int,
@@ -692,20 +694,38 @@ def _run_sub_single(
             )
 
             def _classify(safe_m: str, g_idx: list[int], txts: list[str]):
-                inputs = _tokenize(txts, sub_tokenizers[safe_m], sub_max_length)
-                onnx_in = {
-                    "input_ids": inputs["input_ids"].astype(np.int64),
-                    "attention_mask": inputs["attention_mask"].astype(np.int64),
-                }
-                logits = sub_sessions[safe_m].run(None, onnx_in)[0]
-                probs = _softmax(logits)
-                pred_idx = probs.argmax(axis=1)
-                conf = probs[np.arange(len(pred_idx)), pred_idx]
                 sub_cats = sub_labels_by_major.get(safe_m, subcats_lookup.get(safe_m, ["其他"]))
+                total_rows = len(txts)
+                total_batches = (total_rows + batch_size - 1) // batch_size
+                last_progress_log_at = time.monotonic()
                 results = []
-                for g, p_idx, c_val in zip(g_idx, pred_idx.tolist(), conf.tolist()):
-                    safe_idx = min(p_idx, len(sub_cats) - 1)
-                    results.append((g, sub_cats[safe_idx], float(c_val)))
+
+                for batch_idx, start in enumerate(range(0, total_rows, batch_size), start=1):
+                    end = min(start + batch_size, total_rows)
+                    batch_txts = txts[start:end]
+                    batch_g_idx = g_idx[start:end]
+
+                    now = time.monotonic()
+                    if _should_log_heartbeat(batch_idx, total_batches, now, last_progress_log_at):
+                        logger.info(
+                            f"[Sub/{backend_by_major.get(safe_m, 'unknown')}] Batch {batch_idx}/{total_batches}"
+                            f" | major={safe_m} | rows={end}/{total_rows}"
+                        )
+                        last_progress_log_at = now
+
+                    inputs = _tokenize(batch_txts, sub_tokenizers[safe_m], sub_max_length)
+                    onnx_in = {
+                        "input_ids": inputs["input_ids"].astype(np.int64),
+                        "attention_mask": inputs["attention_mask"].astype(np.int64),
+                    }
+                    logits = sub_sessions[safe_m].run(None, onnx_in)[0]
+                    probs = _softmax(logits)
+                    pred_idx = probs.argmax(axis=1)
+                    conf = probs[np.arange(len(pred_idx)), pred_idx]
+
+                    for g, p_idx, c_val in zip(batch_g_idx, pred_idx.tolist(), conf.tolist()):
+                        safe_idx = min(p_idx, len(sub_cats) - 1)
+                        results.append((g, sub_cats[safe_idx], float(c_val)))
                 return safe_m, results
 
             futures[executor.submit(_classify, safe, g_indices, texts_list)] = safe
@@ -779,6 +799,7 @@ def run_sub(
         f"cuda_provider={cuda_provider_enabled} | "
         f"shard_workers={workers} | "
         f"sub_major_workers={requested_sub_major_workers} | "
+        f"sub_batch_size={p.sub_batch_size} | "
         f"pending_shards={len(pending_jobs)}"
     )
     if pending_jobs and workers > 1:
@@ -790,6 +811,7 @@ def run_sub(
                     intermediate_path,
                     output_path,
                     p.sub_onnx_dir,
+                    p.sub_batch_size,
                     p.sub_max_length,
                     requested_sub_major_workers,
                     workers,
@@ -806,6 +828,7 @@ def run_sub(
                         intermediate_path=intermediate_path,
                         output_path=output_path,
                         sub_onnx_dir=p.sub_onnx_dir,
+                        batch_size=p.sub_batch_size,
                         sub_max_length=p.sub_max_length,
                         sub_major_workers=requested_sub_major_workers,
                         shard_workers=workers,

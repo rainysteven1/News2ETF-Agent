@@ -132,12 +132,14 @@ output_checkpoint = "./trainer/checkpoints/signals"
 # Phase 1 major prediction:
 #   - reads raw news parquet shards from major_input_dir / major_input_glob
 #   - writes major-labeled parquet shards into major_output_dir
+#   - uses major_batch_size
 major_onnx_dir = "./trainer/models/major"
 major_output_dir = "./trainer/data/labeled/signals/major_only"
 major_workers = 1
 major_shard_workers = 2
 major_input_dir = "./trainer/data/news_raw"
 major_input_glob = "*.parquet"
+major_batch_size = 256
 
 # Phase 2 sub prediction:
 #   - reads explicitly from sub_input_dir / sub_input_glob
@@ -145,12 +147,13 @@ major_input_glob = "*.parquet"
 #   - auto-discovers backend from sub_onnx_dir/<backend>/<major>
 #   - validates every required major exists in exactly one backend folder
 #   - writes final labeled parquet shards into output_dir
+#   - uses sub_batch_size
 sub_onnx_dir = "./trainer/models/sub/0407-1415"
 sub_shard_workers = 4
 sub_major_workers = 8
 sub_input_dir = "./trainer/data/labeled/signals/major_only"
 sub_input_glob = "raw.parquet"
 output_dir = "./trainer/data/labeled/signals/raw"
-batch_size = 256
+sub_batch_size = 256
 major_max_length = 128
 sub_max_length = 256
