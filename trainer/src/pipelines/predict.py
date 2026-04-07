@@ -8,6 +8,7 @@ Usage:
 Recommended:
     - Configure `predict.major_input_dir` for raw news parquet shards
     - Configure `predict.sub_input_dir` or `predict.sub_input_paths` explicitly for sub classification inputs
+    - Organize sub ONNX models as `predict.sub_onnx_dir/<backend>/<major>/...`
     - Use process-level shard parallelism to exploit multi-core CPUs
     - Keep per-process ONNX threads modest to avoid CPU oversubscription
 
@@ -62,6 +63,13 @@ def _resolve_ort_threads(cpu_count: int, shard_workers: int) -> tuple[int, int]:
     intra_threads = max(1, min(per_process_budget, 16))
     inter_threads = 1
     return intra_threads, inter_threads
+
+
+def _has_cuda_ort_provider() -> bool:
+    try:
+        return "CUDAExecutionProvider" in ort.get_available_providers()
+    except Exception:
+        return False
 
 
 def _softmax(logits: np.ndarray) -> np.ndarray:
@@ -251,14 +259,80 @@ def _build_major_batch_texts(batch_df: pl.DataFrame) -> list[str]:
     return texts
 
 
-def _build_sub_text(row: dict[str, object]) -> str:
-    title = row["title"]
-    content = row["content"]
-    if title is not None and title != "" and content is not None and content != "":
-        return f"{title} [SEP] {str(content)[:256]}"
-    if content is not None and content != "":
-        return str(content)[:256]
-    return ""
+def _build_sub_text_expr() -> pl.Expr:
+    title = pl.col("title").cast(pl.Utf8).fill_null("")
+    content = pl.col("content").cast(pl.Utf8).fill_null("")
+    content_short = content.str.slice(0, 256)
+    return (
+        pl.when((title != "") & (content != ""))
+        .then(pl.concat_str([title, pl.lit(" [SEP] "), content_short], separator=""))
+        .when(content != "")
+        .then(content_short)
+        .otherwise(title)
+        .alias("sub_text")
+    )
+
+
+def _build_sub_groups(df: pl.DataFrame) -> tuple[dict[str, list[int]], dict[str, list[str]]]:
+    grouped_df = df.with_row_index("row_idx").with_columns(_build_sub_text_expr())
+    safe_to_global_idx: dict[str, list[int]] = {}
+    safe_to_texts: dict[str, list[str]] = {}
+    for part in grouped_df.partition_by("major_category", maintain_order=True):
+        major = part.item(0, "major_category")
+        safe = safe_name(major)
+        safe_to_global_idx[safe] = part["row_idx"].to_list()
+        safe_to_texts[safe] = part["sub_text"].to_list()
+    return safe_to_global_idx, safe_to_texts
+
+
+def _load_sub_labels(
+    safe_major: str,
+    label_map_path: Path,
+    subcats_lookup: dict[str, list[str]],
+) -> list[str]:
+    if label_map_path.exists():
+        with open(label_map_path, encoding="utf-8") as f:
+            label_map = json.load(f)
+        idx_to_label = label_map.get("idx_to_label", {})
+        if idx_to_label:
+            return [idx_to_label[str(i)] for i in range(len(idx_to_label))]
+    return subcats_lookup.get(safe_major, ["其他"])
+
+
+def _discover_sub_model_dirs(sub_onnx_dir: Path, majors: list[str]) -> dict[str, tuple[str, Path]]:
+    backend_dirs = sorted(p for p in sub_onnx_dir.iterdir() if p.is_dir())
+    if not backend_dirs:
+        raise FileNotFoundError(f"No backend directories found under sub_onnx_dir: {sub_onnx_dir}")
+
+    resolved: dict[str, tuple[str, Path]] = {}
+    errors: list[str] = []
+    for major in majors:
+        safe = safe_name(major)
+        matches: list[tuple[str, Path]] = []
+        for backend_dir in backend_dirs:
+            candidate = backend_dir / safe
+            if candidate.is_dir():
+                matches.append((backend_dir.name, candidate))
+
+        if len(matches) != 1:
+            found = [f"{backend}/{safe}" for backend, _ in matches] or ["<none>"]
+            errors.append(f"{major} ({safe}) -> expected exactly 1 match, found {len(matches)}: {found}")
+            continue
+
+        resolved[safe] = matches[0]
+
+    if errors:
+        joined = "\n".join(errors)
+        raise RuntimeError(f"Invalid sub_onnx_dir layout under {sub_onnx_dir}:\n{joined}")
+    return resolved
+
+
+def _log_sub_model_layout(resolved_model_dirs: dict[str, tuple[str, Path]], majors: list[str]) -> None:
+    logger.info("[Sub] Validated sub model layout:")
+    for major in majors:
+        safe = safe_name(major)
+        backend_name, model_dir = resolved_model_dirs[safe]
+        logger.info(f"[Sub/{backend_name}] major={major} | dir={model_dir}")
 
 
 def _filter_major_batch_rows(batch_dict: dict[str, list[object]]) -> tuple[dict[str, list[object]], list[str], int]:
@@ -473,6 +547,13 @@ def run_major(
 
     requested_shard_workers = shard_workers if shard_workers is not None else p.major_shard_workers
     workers = _effective_parallelism(requested_shard_workers, len(pending_jobs))
+    logger.info(
+        f"[Major] Effective parallelism | "
+        f"cuda_provider={_has_cuda_ort_provider()} | "
+        f"shard_workers={workers} | "
+        f"major_workers={p.major_workers} | "
+        f"pending_shards={len(pending_jobs)}"
+    )
     if pending_jobs and workers > 1:
         logger.info(f"[Major] Running {len(pending_jobs)} shards with {workers} processes")
         with ProcessPoolExecutor(max_workers=workers) as executor:
@@ -514,80 +595,74 @@ def _run_sub_single(
     intermediate_path: Path,
     output_path: Path,
     sub_onnx_dir: Path,
-    sub_backend: str,
     sub_max_length: int,
     sub_major_workers: int,
     shard_workers: int,
     limit_rows: int | None = None,
 ) -> Path:
     """Run sub-category classification on one Major intermediate shard."""
-    logger.info(f"[Sub/{sub_backend}] Loading Major intermediate: {intermediate_path}")
+    logger.info(f"[Sub] Loading Major intermediate: {intermediate_path}")
     df = pl.read_parquet(intermediate_path)
-    logger.info(f"[Sub/{sub_backend}] Intermediate parquet loaded: {intermediate_path} | rows={len(df)}")
+    logger.info(f"[Sub] Intermediate parquet loaded: {intermediate_path} | rows={len(df)}")
 
     if limit_rows is not None:
         df = df.head(limit_rows)
-        logger.info(f"[Sub/{sub_backend}] Applied row limit: {limit_rows}")
+        logger.info(f"[Sub] Applied row limit: {limit_rows}")
 
     n = len(df)
-    logger.info(f"[Sub/{sub_backend}] {n} rows to classify")
+    logger.info(f"[Sub] {n} rows to classify")
 
     cpu_count = os.cpu_count() or 1
     intra_threads, inter_threads = _resolve_ort_threads(cpu_count, shard_workers)
-    logger.info(f"[Sub/{sub_backend}] CPU cores={cpu_count}, ORT threads: intra={intra_threads}, inter={inter_threads}")
+    logger.info(f"[Sub] CPU cores={cpu_count}, ORT threads: intra={intra_threads}, inter={inter_threads}")
+
+    logger.info(f"[Sub] Grouping rows by major category")
+    safe_to_global_idx, safe_to_texts = _build_sub_groups(df)
+    logger.info(f"[Sub] Grouping complete: {len(safe_to_global_idx)} major buckets")
 
     label_stats = LabelStats.load()
     major_categories = label_stats.get_major_categories()
     major_to_subcats: dict[str, list[str]] = {m: label_stats.get_sub_categories(m) for m in major_categories}
-
-    sub_sessions: dict[str, ort.InferenceSession] = {}
-    sub_tokenizers: dict[str, AutoTokenizer] = {}
-    sub_labels_by_major: dict[str, list[str]] = {}
-
-    assert sub_onnx_dir is not None, "sub_onnx_dir must be set in config.toml"
-
-    for m in major_categories:
-        safe = safe_name(m)
-        major_dir = sub_onnx_dir / safe
-        onnx_path = major_dir / "best.onnx"
-        tokenizer_path = major_dir / "tokenizer"
-        label_map_path = major_dir / "label_map.json"
-
-        if not onnx_path.exists() or not tokenizer_path.exists():
-            logger.warning(f"[Sub/{sub_backend}] ONNX/tokenizer not found for '{safe}', will use fallback '其他'")
-            continue
-
-        logger.info(f"[Sub/{sub_backend}] Loading ONNX for '{safe}'")
-        sub_sessions[safe] = _make_ort_session(onnx_path, intra_threads, inter_threads)
-        sub_tokenizers[safe] = AutoTokenizer.from_pretrained(str(tokenizer_path))
-        if sub_backend == "supervised" and label_map_path.exists():
-            with open(label_map_path, encoding="utf-8") as f:
-                label_map = json.load(f)
-            idx_to_label = label_map.get("idx_to_label", {})
-            sub_labels_by_major[safe] = [idx_to_label[str(i)] for i in range(len(idx_to_label))]
-
-    if not sub_sessions:
-        raise RuntimeError(f"No sub ONNX models loaded for backend={sub_backend}")
-    logger.info(f"[Sub/{sub_backend}] Loaded {len(sub_sessions)} per-major ONNX models")
-
     subcats_lookup = {
         **{k: v for k, v in major_to_subcats.items()},
         **{safe_name(k): v for k, v in major_to_subcats.items()},
     }
 
-    safe_to_global_idx: dict[str, list[int]] = {}
-    safe_to_texts: dict[str, list[str]] = {}
+    sub_sessions: dict[str, ort.InferenceSession] = {}
+    sub_tokenizers: dict[str, AutoTokenizer] = {}
+    sub_labels_by_major: dict[str, list[str]] = {}
+    backend_by_major: dict[str, str] = {}
 
-    logger.info(f"[Sub/{sub_backend}] Grouping rows by major category")
-    for i, row in df.iter_rows(named=True):
-        major = row["major_category"]
-        safe = safe_name(major)
-        if safe not in safe_to_global_idx:
-            safe_to_global_idx[safe] = []
-            safe_to_texts[safe] = []
-        safe_to_global_idx[safe].append(i)
-        safe_to_texts[safe].append(_build_sub_text(row))
-    logger.info(f"[Sub/{sub_backend}] Grouping complete: {len(safe_to_global_idx)} major buckets")
+    assert sub_onnx_dir is not None, "sub_onnx_dir must be set in config.toml"
+    major_model_dirs = _discover_sub_model_dirs(sub_onnx_dir, major_categories)
+
+    present_safes = sorted(safe_to_global_idx.keys())
+    logger.info(f"[Sub] Loading models only for majors in shard: {present_safes}")
+
+    for safe in present_safes:
+        if safe not in major_model_dirs:
+            logger.warning(f"[Sub] Major '{safe}' not found in validated model directory map, will use fallback '其他'")
+            continue
+        backend_name, major_dir = major_model_dirs[safe]
+        onnx_path = major_dir / "best.onnx"
+        tokenizer_path = major_dir / "tokenizer"
+        label_map_path = major_dir / "label_map.json"
+
+        if not onnx_path.exists() or not tokenizer_path.exists():
+            logger.warning(
+                f"[Sub/{backend_name}] ONNX/tokenizer not found for '{safe}' in {major_dir}, will use fallback '其他'"
+            )
+            continue
+
+        logger.info(f"[Sub/{backend_name}] Loading ONNX for '{safe}' from {major_dir}")
+        sub_sessions[safe] = _make_ort_session(onnx_path, intra_threads, inter_threads)
+        sub_tokenizers[safe] = AutoTokenizer.from_pretrained(str(tokenizer_path))
+        sub_labels_by_major[safe] = _load_sub_labels(safe, label_map_path, subcats_lookup)
+        backend_by_major[safe] = backend_name
+
+    if not sub_sessions:
+        raise RuntimeError(f"No sub ONNX models loaded from sub_onnx_dir={sub_onnx_dir}")
+    logger.info(f"[Sub] Loaded {len(sub_sessions)} per-major ONNX models for this shard")
 
     sub_cats_out = np.full(n, "其他", dtype=object)
     sub_confs_out = np.zeros(n, dtype=np.float64)
@@ -605,13 +680,14 @@ def _run_sub_single(
                 for g in g_indices:
                     sub_cats_out[g] = sub_cats[-1]
                     sub_confs_out[g] = 0.0
-                logger.info(f"  Sub/{sub_backend} fallback {safe}: {len(g_indices)} rows (no model)")
+                logger.info(f"[Sub] Fallback {safe}: {len(g_indices)} rows (no model)")
                 continue
 
             texts_list = safe_to_texts[safe]
             submitted_groups += 1
+            backend_name = backend_by_major.get(safe, "unknown")
             logger.info(
-                f"[Sub/{sub_backend}] Tokenizing group {submitted_groups}/{total_groups}"
+                f"[Sub/{backend_name}] Tokenizing group {submitted_groups}/{total_groups}"
                 f" | major={safe} | rows={len(g_indices)}"
             )
 
@@ -634,14 +710,15 @@ def _run_sub_single(
 
             futures[executor.submit(_classify, safe, g_indices, texts_list)] = safe
 
-        for future in futures:
+        for future in as_completed(futures):
             safe_major, results = future.result()
             for g, sub_cat, conf_val in results:
                 sub_cats_out[g] = sub_cat
                 sub_confs_out[g] = conf_val
             elapsed = time.monotonic() - t0
+            backend_name = backend_by_major.get(safe_major, "unknown")
             logger.info(
-                f"[Sub/{sub_backend}] Inference complete | major={safe_major}"
+                f"[Sub/{backend_name}] Inference complete | major={safe_major}"
                 f" | rows={len(results)} | {elapsed:.1f}s total"
             )
 
@@ -652,7 +729,7 @@ def _run_sub_single(
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     result_df.write_parquet(output_path)
-    logger.success(f"[Sub/{sub_backend}] Complete output → {output_path}")
+    logger.success(f"[Sub] Complete output → {output_path}")
     return output_path
 
 
@@ -670,6 +747,9 @@ def run_sub(
     assert intermediate_paths, "No sub input parquet files found in configured source"
     assert p.output_dir is not None or p.output_path is not None, "output_dir or output_path must be set in config.toml"
     assert p.sub_onnx_dir is not None, "sub_onnx_dir must be set in config.toml"
+    major_categories = LabelStats.load().get_major_categories()
+    resolved_model_dirs = _discover_sub_model_dirs(p.sub_onnx_dir, major_categories)
+    _log_sub_model_layout(resolved_model_dirs, major_categories)
 
     total_inputs = len(intermediate_paths)
     outputs: list[Path] = []
@@ -677,15 +757,32 @@ def run_sub(
     for intermediate_path in intermediate_paths:
         output_path = _derive_sub_output_path(intermediate_path, p, total_inputs)
         if output_path.exists() and not overwrite:
-            logger.info(f"[Sub/{p.sub_backend}] Skip existing shard output: {output_path}")
+            logger.info(f"[Sub] Skip existing shard output: {output_path}")
             outputs.append(output_path)
             continue
         pending_jobs.append((intermediate_path, output_path))
 
+    requested_sub_major_workers = sub_major_workers if sub_major_workers is not None else p.sub_major_workers
+    cuda_provider_enabled = _has_cuda_ort_provider()
+
     requested_shard_workers = shard_workers if shard_workers is not None else p.sub_shard_workers
+    if shard_workers is None and cuda_provider_enabled:
+        if requested_shard_workers != 1:
+            logger.info(
+                f"[Sub] CUDAExecutionProvider detected; "
+                f"defaulting sub shard workers from {requested_shard_workers} to 1 for single-GPU efficiency"
+            )
+        requested_shard_workers = 1
     workers = _effective_parallelism(requested_shard_workers, len(pending_jobs))
+    logger.info(
+        f"[Sub] Effective parallelism | "
+        f"cuda_provider={cuda_provider_enabled} | "
+        f"shard_workers={workers} | "
+        f"sub_major_workers={requested_sub_major_workers} | "
+        f"pending_shards={len(pending_jobs)}"
+    )
     if pending_jobs and workers > 1:
-        logger.info(f"[Sub/{p.sub_backend}] Running {len(pending_jobs)} shards with {workers} processes")
+        logger.info(f"[Sub] Running {len(pending_jobs)} shards with {workers} processes")
         with ProcessPoolExecutor(max_workers=workers) as executor:
             futures = {
                 executor.submit(
@@ -693,9 +790,8 @@ def run_sub(
                     intermediate_path,
                     output_path,
                     p.sub_onnx_dir,
-                    p.sub_backend,
                     p.sub_max_length,
-                    sub_major_workers if sub_major_workers is not None else p.sub_major_workers,
+                    requested_sub_major_workers,
                     workers,
                     limit_rows,
                 ): output_path
@@ -706,15 +802,14 @@ def run_sub(
     else:
         for intermediate_path, output_path in pending_jobs:
             outputs.append(
-                _run_sub_single(
-                    intermediate_path=intermediate_path,
-                    output_path=output_path,
-                    sub_onnx_dir=p.sub_onnx_dir,
-                    sub_backend=p.sub_backend,
-                    sub_max_length=p.sub_max_length,
-                    sub_major_workers=sub_major_workers if sub_major_workers is not None else p.sub_major_workers,
-                    shard_workers=workers,
-                    limit_rows=limit_rows,
+                    _run_sub_single(
+                        intermediate_path=intermediate_path,
+                        output_path=output_path,
+                        sub_onnx_dir=p.sub_onnx_dir,
+                        sub_max_length=p.sub_max_length,
+                        sub_major_workers=requested_sub_major_workers,
+                        shard_workers=workers,
+                        limit_rows=limit_rows,
                 )
             )
     outputs.sort()

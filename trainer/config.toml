@@ -142,8 +142,9 @@ major_input_glob = "*.parquet"
 # Phase 2 sub prediction:
 #   - reads explicitly from sub_input_dir / sub_input_glob
 #   - falls back to major_output_dir only if sub_input_* is not configured
+#   - auto-discovers backend from sub_onnx_dir/<backend>/<major>
+#   - validates every required major exists in exactly one backend folder
 #   - writes final labeled parquet shards into output_dir
-sub_backend = "supervised"
 sub_onnx_dir = "./trainer/models/sub/0407-1415"
 sub_shard_workers = 4
 sub_major_workers = 8

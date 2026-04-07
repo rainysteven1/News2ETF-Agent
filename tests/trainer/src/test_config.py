@@ -15,7 +15,6 @@ def test_load_config_resolves_predict_paths():
     assert cfg.prediction.major_shard_workers > 0
     assert cfg.prediction.sub_shard_workers > 0
     assert cfg.prediction.sub_major_workers > 0
-    assert cfg.prediction.sub_backend in {"setfit", "supervised"}
     assert cfg.prediction.major_input_dir.is_absolute()
     assert cfg.prediction.sub_input_dir.is_absolute()
     assert cfg.prediction.output_dir.is_absolute()

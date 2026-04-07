@@ -29,7 +29,6 @@ class PredictionConfig(BaseModel):
     major_input_glob: str = "*.parquet"
     major_input_path: Path | None = None
     major_input_paths: list[Path] | None = None
-    sub_backend: Literal["setfit", "supervised"] = "setfit"
     sub_onnx_dir: Path | None = None
     sub_shard_workers: int = 4
     sub_major_workers: int = 8
