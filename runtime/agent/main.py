@@ -8,11 +8,12 @@ Usage:
 from __future__ import annotations
 
 import functools
+import json
 import os
 import random
 import uuid
 from collections.abc import Callable
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Annotated
 
@@ -26,7 +27,7 @@ from src.backtest.diagnostics import diagnose_backtest
 from src.backtest.engine import WalkForwardEngine
 from src.config import AgentRootConfig, get_config, init_config, runtime_root
 from src.env import load_project_env
-from src.logger import init_logger
+from src.logger import init_logger, logger
 from src.runtime import init_runtime
 from src.wandb_handler import WandbRegistry
 
@@ -35,6 +36,79 @@ console = Console()
 _ROOT = runtime_root()
 
 load_project_env(_ROOT)
+
+
+def _path_or_none(value: object) -> Path | None:
+    if value is None:
+        return None
+    if isinstance(value, Path):
+        return value
+    if isinstance(value, str):
+        return Path(value)
+    return None
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _run_meta_path(checkpoint_dir: Path | None, run_id: str | None) -> Path | None:
+    if checkpoint_dir is None or not run_id:
+        return None
+    return Path(checkpoint_dir) / run_id / "run_meta.json"
+
+
+def _load_run_meta(checkpoint_dir: Path | None, run_id: str | None) -> dict[str, object]:
+    path = _run_meta_path(checkpoint_dir, run_id)
+    if path is None or not path.exists():
+        return {}
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _save_run_meta(checkpoint_dir: Path | None, run_id: str | None, payload: dict[str, object]) -> Path | None:
+    path = _run_meta_path(checkpoint_dir, run_id)
+    if path is None:
+        return None
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    return path
+
+
+def _validate_backtest_inputs(cfg: object) -> None:
+    data = getattr(cfg, "data", None)
+    predict = getattr(cfg, "predict", None)
+    if data is None or predict is None:
+        return
+
+    feature_candidates = [
+        _path_or_none(getattr(data, "output_agent_features_oof", None)),
+        _path_or_none(getattr(data, "output_agent_features", None)),
+    ]
+    if any(path is not None and path.exists() for path in feature_candidates):
+        return
+
+    sentiment_path = _path_or_none(getattr(data, "output_sentiment", None))
+    bundle_dir = _path_or_none(getattr(predict, "signals_onnx_dir", None))
+
+    if sentiment_path is None or not sentiment_path.exists():
+        raise FileNotFoundError(
+            "Backtest requires either precomputed agent features or the signals sentiment dataset.\n"
+            f"- Missing sentiment dataset: {sentiment_path}\n"
+            f"- Expected feature caches: {feature_candidates[0]} or {feature_candidates[1]}\n"
+            "Generate the sentiment dataset with `just signals-train-final-3y` "
+            "or `./.venv/bin/python -m trainer.main signals train`.\n"
+            "If you already have an exported ONNX bundle and only need the held-out features, run `just signals-infer-2024`."
+        )
+
+    if bundle_dir is None or not bundle_dir.exists():
+        raise FileNotFoundError(
+            "Backtest could not find precomputed agent features, so it needs the exported signals ONNX bundle "
+            "to rebuild them on demand.\n"
+            f"- Missing bundle dir: {bundle_dir}\n"
+            f"- Available sentiment dataset: {sentiment_path}\n"
+            "Export the bundle with `just signals-export-onnx-final-3y`, "
+            "or run the full pipeline with `just signals-agent-pipeline-2024`."
+        )
 
 
 def _print_table(title: str, rows: list[tuple[str, str]]) -> None:
@@ -76,12 +150,31 @@ def _init_src(
     init_runtime(run_id=run_id, checkpoint_dir=checkpoint_dir)
     os.environ.setdefault("WANDB_DIR", str(_ROOT / "wandb"))
     if init_wandb:
+        run_meta = _load_run_meta(checkpoint_dir, run_id)
+        existing_wandb_id = str(run_meta.get("wandb_run_id", "") or "") or None
+        if existing_wandb_id:
+            logger.info("Resuming W&B run: run_id={} wandb_run_id={}", run_id, existing_wandb_id)
         WandbRegistry.init(
             "backtest",
             run_name=run_id or "src-run",
             cfg_dict=cfg.model_dump(mode="json"),
             tags=wandb_tags or ["backtest"],
+            existing_run_id=existing_wandb_id,
+            resume="must" if existing_wandb_id else None,
         )
+        handler = WandbRegistry.get("backtest")
+        if handler is not None:
+            now = _utc_now_iso()
+            _save_run_meta(
+                checkpoint_dir,
+                run_id,
+                {
+                    "run_id": run_id,
+                    "created_at": str(run_meta.get("created_at", "") or now),
+                    "updated_at": now,
+                    **handler.metadata(),
+                },
+            )
     return cfg
 
 
@@ -185,6 +278,11 @@ def backtest(
         ],
     )
 
+    try:
+        _validate_backtest_inputs(cfg)
+    except FileNotFoundError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(1) from exc
     workflow = build_workflow(cfg)
     engine = WalkForwardEngine(cfg, checkpoint_dir=_ROOT / "checkpoints")
     engine.run(

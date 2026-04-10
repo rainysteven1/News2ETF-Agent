@@ -18,16 +18,31 @@ class WandbHandler:
         self._run = None
         self._run_id: str | None = None
         self._tables: dict[str, Any] = {}
+        self._run_name: str | None = None
+        self._tags: list[str] = []
 
     @property
     def id(self) -> str | None:
         return self._run_id
+
+    def metadata(self) -> dict[str, Any]:
+        run_name = self._run.name if self._run is not None else self._run_name
+        return {
+            "wandb_run_id": self._run_id,
+            "wandb_run_name": run_name,
+            "project": self._cfg.project,
+            "entity": self._cfg.entity,
+            "mode": self._cfg.mode,
+            "tags": list(self._tags),
+        }
 
     def init_run(
         self,
         run_name: str,
         cfg_dict: dict[str, Any] | None = None,
         tags: list[str] | None = None,
+        existing_run_id: str | None = None,
+        resume: str | None = None,
     ) -> None:
         try:
             import wandb
@@ -35,14 +50,22 @@ class WandbHandler:
             logger.warning("[Wandb] wandb package not installed, run logging disabled")
             return
 
-        self._run = wandb.init(
-            project=self._cfg.project,
-            entity=self._cfg.entity,
-            name=run_name,
-            config=cfg_dict,
-            tags=tags,
-            mode=self._cfg.mode,
-        )
+        self._run_name = run_name
+        self._tags = list(tags or [])
+
+        init_kwargs: dict[str, Any] = {
+            "project": self._cfg.project,
+            "entity": self._cfg.entity,
+            "name": run_name,
+            "config": cfg_dict,
+            "tags": self._tags,
+            "mode": self._cfg.mode,
+        }
+        if existing_run_id:
+            init_kwargs["id"] = existing_run_id
+            init_kwargs["resume"] = resume or "must"
+
+        self._run = wandb.init(**init_kwargs)
         self._run_id = self._run.id if self._run is not None else None
 
     def log_metrics(self, metrics: dict[str, Any], step: int | None = None) -> None:
@@ -70,7 +93,19 @@ class WandbHandler:
             return
 
         table.add_data(*[row.get(col) for col in columns])
-        self._run.log({name: table}, step=step)
+        del step
+
+    def log_table_rows(self, name: str, rows: list[dict[str, Any]], step: int | None = None) -> None:
+        if self._run is None or not rows:
+            return
+
+        self._tables.pop(name, None)
+        for row in rows:
+            self.log_table_row(name, row)
+
+        table = self._tables.get(name)
+        if table is not None:
+            self._run.log({name: table}, step=step)
 
     def log_summary(self, metrics: dict[str, Any]) -> None:
         if self._run is None:
@@ -146,10 +181,18 @@ class WandbRegistry:
         run_name: str,
         cfg_dict: dict[str, Any] | None = None,
         tags: list[str] | None = None,
+        existing_run_id: str | None = None,
+        resume: str | None = None,
     ) -> None:
         cls._login()
         handler = WandbHandler()
-        handler.init_run(run_name=run_name, cfg_dict=cfg_dict, tags=tags)
+        handler.init_run(
+            run_name=run_name,
+            cfg_dict=cfg_dict,
+            tags=tags,
+            existing_run_id=existing_run_id,
+            resume=resume,
+        )
         cls._handlers[key] = handler
 
     @classmethod

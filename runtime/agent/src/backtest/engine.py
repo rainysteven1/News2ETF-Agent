@@ -18,7 +18,7 @@ from __future__ import annotations
 import json
 import uuid
 from typing import Any
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import polars as pl
@@ -108,6 +108,64 @@ def _format_weekly_decisions(decisions: list[dict], include_reason: bool = False
     return " | ".join(parts) if parts else "-"
 
 
+def _result_to_wandb_row(result: dict[str, Any]) -> dict[str, Any]:
+    observations = result.get("observations", {}) or {}
+    decision_payload = result.get("agent_decisions", []) or []
+    total_value = float(result.get("total_value", result.get("nav", 0.0)) or 0.0)
+    return {
+        "week_start": str(result.get("week_start", "")),
+        "weekly_return": float(result.get("weekly_return", 0.0) or 0.0),
+        "total_value": total_value,
+        "market_closed_week": bool(result.get("market_closed_week", False)),
+        "trading_day_count": int(result.get("trading_day_count", 0) or 0),
+        "first_trading_day": str(result.get("first_trading_day", "") or ""),
+        "last_trading_day": str(result.get("last_trading_day", "") or ""),
+        "invested_weight": float(result.get("invested_weight", 0.0) or 0.0),
+        "cash_weight": float(result.get("cash_weight", 0.0) or 0.0),
+        "decision_count": int(len(decision_payload)),
+        "last_error": _truncate_wandb_text(result.get("last_error", "-") or "-"),
+        "decision_text": _truncate_wandb_text(_format_weekly_decisions(decision_payload)),
+        "decision_reasons": _truncate_wandb_text(
+            _format_weekly_decisions(decision_payload, include_reason=True),
+            limit=1200,
+        ),
+        "researcher_summary": _truncate_wandb_text(observations.get("researcher_summary", "")),
+        "tool_build_decision_context": _truncate_wandb_text(
+            observations.get("tool_build_decision_context", ""),
+            limit=800,
+        ),
+        "tool_read_market_news": _truncate_wandb_text(
+            observations.get("tool_read_market_news", ""),
+            limit=800,
+        ),
+        "tool_compute_ml_signals": _truncate_wandb_text(
+            observations.get("tool_compute_ml_signals", ""),
+            limit=800,
+        ),
+        "tool_check_last_week_pnl": _truncate_wandb_text(
+            observations.get("tool_check_last_week_pnl", ""),
+            limit=400,
+        ),
+        "tool_get_industry_top_news": _truncate_wandb_text(
+            observations.get("tool_get_industry_top_news", ""),
+            limit=800,
+        ),
+    }
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _format_trade_dt(value: int | str | None) -> str:
+    if value in (None, ""):
+        return ""
+    digits = str(value)
+    if len(digits) == 8 and digits.isdigit():
+        return f"{digits[:4]}-{digits[4:6]}-{digits[6:]}"
+    return digits
+
+
 class WalkForwardEngine:
     """Walk-forward backtesting engine that runs weekly."""
 
@@ -142,7 +200,8 @@ class WalkForwardEngine:
     def _get_etf_universe(self):
         resolver = getattr(self, "_etf_universe", None)
         if resolver is None:
-            data_cfg = getattr(self.config, "data", None)
+            config = getattr(self, "config", None)
+            data_cfg = getattr(config, "data", None)
             etf_info = getattr(data_cfg, "etf_info", None)
             etf_prices = getattr(data_cfg, "etf_prices", None)
             if not etf_info or not etf_prices:
@@ -159,6 +218,37 @@ class WalkForwardEngine:
             else:
                 logger.warning("ETF prices not found at {}", path)
         return self._etf_prices
+
+    def _get_week_trading_window(self, etf_prices: pl.DataFrame | None, week_start: str) -> dict[str, Any]:
+        if etf_prices is None:
+            return {
+                "market_closed_week": True,
+                "trading_day_count": 0,
+                "first_trading_day": "",
+                "last_trading_day": "",
+                "trade_dates": [],
+            }
+        week_start_dt = datetime.strptime(week_start, "%Y-%m-%d")
+        next_week_int = int((week_start_dt + timedelta(days=7)).strftime("%Y%m%d"))
+        week_start_int = int(week_start_dt.strftime("%Y%m%d"))
+        week_df = etf_prices.filter((pl.col("trade_dt") >= week_start_int) & (pl.col("trade_dt") < next_week_int))
+        if len(week_df) == 0:
+            return {
+                "market_closed_week": True,
+                "trading_day_count": 0,
+                "first_trading_day": "",
+                "last_trading_day": "",
+                "trade_dates": [],
+            }
+
+        trade_dates = sorted(set(int(value) for value in week_df["trade_dt"].to_list()))
+        return {
+            "market_closed_week": False,
+            "trading_day_count": len(trade_dates),
+            "first_trading_day": _format_trade_dt(trade_dates[0]),
+            "last_trading_day": _format_trade_dt(trade_dates[-1]),
+            "trade_dates": trade_dates,
+        }
 
     def _get_week_starts(self, start_date: str, end_date: str) -> list[str]:
         """Return list of Monday date strings between start and end."""
@@ -178,6 +268,27 @@ class WalkForwardEngine:
     def _checkpoint_run_dir(self, run_id: str) -> Path:
         return self.checkpoint_dir / run_id
 
+    def _run_meta_path(self, run_id: str) -> Path:
+        return self._checkpoint_run_dir(run_id) / "run_meta.json"
+
+    def _load_run_meta(self, run_id: str) -> dict[str, Any]:
+        path = self._run_meta_path(run_id)
+        if not path.exists():
+            return {}
+        return json.loads(path.read_text(encoding="utf-8"))
+
+    def _update_run_meta(self, run_id: str, **fields: Any) -> Path:
+        path = self._run_meta_path(run_id)
+        payload = self._load_run_meta(run_id)
+        now = _utc_now_iso()
+        payload.setdefault("run_id", run_id)
+        payload.setdefault("created_at", now)
+        payload["updated_at"] = now
+        payload.update(fields)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        return path
+
     def _checkpoint_path(self, run_id: str, completed_week: str) -> Path:
         return self._checkpoint_run_dir(run_id) / f"{completed_week}.json"
 
@@ -186,6 +297,68 @@ class WalkForwardEngine:
 
     def _backtest_metrics_path(self, run_id: str) -> Path:
         return self._checkpoint_run_dir(run_id) / "backtest_metrics.parquet"
+
+    def _write_checkpoint_payload(
+        self,
+        *,
+        run_id: str,
+        completed_week: str,
+        payload: dict[str, Any],
+        write_latest: bool,
+    ) -> Path:
+        checkpoint_path = self._checkpoint_path(run_id, completed_week)
+        checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+        serialized = json.dumps(payload, ensure_ascii=False, indent=2)
+        checkpoint_path.write_text(serialized, encoding="utf-8")
+        if write_latest:
+            latest_path = self._checkpoint_run_dir(run_id) / "latest.json"
+            latest_path.write_text(serialized, encoding="utf-8")
+        return checkpoint_path
+
+    def _repair_checkpoint_selected_etfs(
+        self,
+        *,
+        run_id: str,
+        completed_week: str,
+        payload: dict[str, Any],
+        target_week: str,
+        write_latest: bool,
+    ) -> list[str]:
+        portfolio = Portfolio()
+        portfolio.restore(payload.get("portfolio", {}))
+        if portfolio.invested_weight <= 0:
+            return []
+
+        before_selected = dict(portfolio.selected_etfs)
+        repaired: list[str] = []
+        etf_prices = self._load_etf_prices()
+        if etf_prices is not None:
+            repaired.extend(
+                portfolio.repair_selected_etfs_from_price_map(
+                    etf_prices,
+                    target_week,
+                    self._meta_sector_etf_code_map,
+                )
+            )
+        repaired.extend(
+            portfolio.repair_missing_selected_etfs(
+                resolver=self._get_etf_universe(),
+                week_start=target_week,
+                mapper=getattr(self, "mapper", None),
+            )
+        )
+        repaired = list(dict.fromkeys(repaired))
+        if portfolio.selected_etfs == before_selected:
+            return repaired
+
+        payload["portfolio"] = portfolio.snapshot()
+        self._write_checkpoint_payload(
+            run_id=run_id,
+            completed_week=completed_week,
+            payload=payload,
+            write_latest=write_latest,
+        )
+        return repaired
 
     def _save_checkpoint(
         self,
@@ -201,8 +374,6 @@ class WalkForwardEngine:
         prev_agent_decisions: list[dict[str, Any]],
     ) -> Path:
         """Save resumable weekly checkpoint after a week has been fully processed."""
-        run_dir = self._checkpoint_run_dir(run_id)
-        run_dir.mkdir(parents=True, exist_ok=True)
         payload = {
             "run_id": run_id,
             "completed_week": completed_week,
@@ -216,10 +387,20 @@ class WalkForwardEngine:
             },
             "results": results,
         }
-        checkpoint_path = self._checkpoint_path(run_id, completed_week)
-        checkpoint_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-        latest_path = run_dir / "latest.json"
-        latest_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        checkpoint_path = self._write_checkpoint_payload(
+            run_id=run_id,
+            completed_week=completed_week,
+            payload=payload,
+            write_latest=True,
+        )
+        self._update_run_meta(
+            run_id,
+            latest_completed_week=completed_week,
+            latest_checkpoint_path=str(checkpoint_path),
+            latest_total_value=float(portfolio.total_value),
+            latest_weekly_return=float(last_week_return),
+            latest_cash_weight=float(portfolio.cash_weight),
+        )
         return checkpoint_path
 
     def _load_checkpoint(self, *, run_id: str, completed_week: str) -> dict[str, Any]:
@@ -383,8 +564,36 @@ class WalkForwardEngine:
         last_week_returns: dict[str, float] = {}
 
         results: list[dict[str, Any]] = []
+        wandb_trace_rows: list[dict[str, Any]] = []
         if resume_from_week:
             checkpoint = preloaded_checkpoint or self._load_checkpoint(run_id=run_id, completed_week=resume_from_week)
+            run_meta = self._load_run_meta(run_id)
+            next_resume_week = next(
+                (
+                    week
+                    for week in all_week_starts
+                    if week > resume_from_week and (resume_to_week is None or week <= resume_to_week)
+                ),
+                resume_from_week,
+            )
+            should_refresh_latest = resume_latest or (
+                str(run_meta.get("latest_completed_week", "") or "") == resume_from_week
+            )
+            repaired = self._repair_checkpoint_selected_etfs(
+                run_id=run_id,
+                completed_week=resume_from_week,
+                payload=checkpoint,
+                target_week=next_resume_week,
+                write_latest=should_refresh_latest,
+            )
+            if repaired:
+                logger.warning(
+                    "[Resume ETF Repair] run_id={} completed_week={} target_week={} repaired_selected_etfs={}",
+                    run_id,
+                    resume_from_week,
+                    next_resume_week,
+                    ",".join(repaired),
+                )
             portfolio.restore(checkpoint.get("portfolio", {}))
             memory = checkpoint.get("memory", {})
             last_week_return = float(memory.get("last_week_return", 0.0) or 0.0)
@@ -395,12 +604,24 @@ class WalkForwardEngine:
                 str(k): float(v) for k, v in dict(memory.get("last_week_returns", {})).items()
             }
             results = list(checkpoint.get("results", []))
+            wandb_trace_rows = [_result_to_wandb_row(item) for item in results]
             logger.info(
                 "Loaded checkpoint for run_id={} completed_week={} results={} nav={:.2f}",
                 run_id,
                 resume_from_week,
                 len(results),
                 portfolio.total_value,
+            )
+            logger.info(
+                "Resume summary: run_id={} local_checkpoint={} wandb_run_id={} prior_results={} latest_completed_week={} latest_total_value={} latest_weekly_return={} latest_cash_weight={}",
+                run_id,
+                self._checkpoint_path(run_id, resume_from_week),
+                run_meta.get("wandb_run_id", "-"),
+                len(results),
+                run_meta.get("latest_completed_week", resume_from_week),
+                run_meta.get("latest_total_value", portfolio.total_value),
+                run_meta.get("latest_weekly_return", last_week_return),
+                run_meta.get("latest_cash_weight", portfolio.cash_weight),
             )
 
         week_starts = [
@@ -418,6 +639,21 @@ class WalkForwardEngine:
             decision_payload: list[dict[str, Any]] = []
             current_observations: dict = {}
             current_error = ""
+            trading_window = self._get_week_trading_window(etf_prices, week_start)
+            week_has_trading = not trading_window["market_closed_week"]
+            logger.info(
+                "[Week Trading Window] week={} trading_day_count={} first_trading_day={} last_trading_day={} market_closed_week={}",
+                week_start,
+                trading_window["trading_day_count"],
+                trading_window["first_trading_day"] or "-",
+                trading_window["last_trading_day"] or "-",
+                trading_window["market_closed_week"],
+            )
+            if trading_window["market_closed_week"]:
+                logger.warning(
+                    "[Week Holiday Window] week={} has no trading sessions in the Monday-Friday bucket; treating as market-closed week",
+                    week_start,
+                )
             if agent_workflow is not None:
                 from src.agent.state import AgentState
 
@@ -465,9 +701,29 @@ class WalkForwardEngine:
             # ── Step 2: Apply decisions for THIS week ───────────────────────────
             # NO direct overwrite of portfolio.holdings or portfolio.total_value.
             # apply_decisions() handles 摩擦成本, 滑点, and target normalization.
-            if decisions:
+            if decisions and not week_has_trading:
+                week_end = (datetime.strptime(week_start, "%Y-%m-%d") + timedelta(days=6)).strftime("%Y-%m-%d")
+                logger.warning(
+                    "[Week Market Closed] week={} no ETF trading rows between {} and {}; skipping decision execution",
+                    week_start,
+                    week_start,
+                    week_end,
+                )
+            elif decisions:
                 formatted = [d.model_dump() if hasattr(d, "model_dump") else dict(d) for d in decisions]
                 portfolio.apply_decisions(formatted)
+                if etf_prices is not None:
+                    repaired = portfolio.repair_selected_etfs_from_price_map(
+                        etf_prices,
+                        week_start,
+                        self._meta_sector_etf_code_map,
+                    )
+                    if repaired:
+                        logger.warning(
+                            "[Week ETF Repair] week={} repaired_selected_etfs_from_prices={}",
+                            week_start,
+                            ",".join(repaired),
+                        )
                 repaired = portfolio.repair_missing_selected_etfs(
                     resolver=self._get_etf_universe(),
                     week_start=week_start,
@@ -493,7 +749,18 @@ class WalkForwardEngine:
             weekly_return = 0.0
             sector_contributions: dict[str, float] = {}
             sector_returns: dict[str, float] = {}
-            if etf_prices is not None and portfolio.invested_weight > 0:
+            if week_has_trading and etf_prices is not None and portfolio.invested_weight > 0:
+                repaired = portfolio.repair_selected_etfs_from_price_map(
+                    etf_prices,
+                    week_start,
+                    self._meta_sector_etf_code_map,
+                )
+                if repaired:
+                    logger.warning(
+                        "[Week ETF Repair] week={} repaired_selected_etfs_from_prices={}",
+                        week_start,
+                        ",".join(repaired),
+                    )
                 repaired = portfolio.repair_missing_selected_etfs(
                     resolver=self._get_etf_universe(),
                     week_start=week_start,
@@ -543,48 +810,12 @@ class WalkForwardEngine:
                         "week_index": len(results) + 1,
                         "week/weekly_return": weekly_return,
                         "week/nav": portfolio.total_value,
+                        "week/total_value": portfolio.total_value,
+                        "week/market_closed_week": int(trading_window["market_closed_week"]),
+                        "week/trading_day_count": int(trading_window["trading_day_count"]),
                         "week/invested_weight": portfolio.invested_weight,
                         "week/cash_weight": portfolio.cash_weight,
                         "week/decision_count": len(decisions),
-                    },
-                    step=len(results) + 1,
-                )
-                wandb_handler.log_table_row(
-                    "backtest/weekly_trace",
-                    {
-                        "week_start": week_start,
-                        "weekly_return": float(weekly_return),
-                        "nav": float(portfolio.total_value),
-                        "invested_weight": float(portfolio.invested_weight),
-                        "cash_weight": float(portfolio.cash_weight),
-                        "decision_count": int(len(decisions)),
-                        "last_error": _truncate_wandb_text(current_error or "-"),
-                        "decision_text": _truncate_wandb_text(_format_weekly_decisions(decision_payload)),
-                        "decision_reasons": _truncate_wandb_text(
-                            _format_weekly_decisions(decision_payload, include_reason=True),
-                            limit=1200,
-                        ),
-                        "researcher_summary": _truncate_wandb_text(current_observations.get("researcher_summary", "")),
-                        "tool_build_decision_context": _truncate_wandb_text(
-                            current_observations.get("tool_build_decision_context", ""),
-                            limit=800,
-                        ),
-                        "tool_read_market_news": _truncate_wandb_text(
-                            current_observations.get("tool_read_market_news", ""),
-                            limit=800,
-                        ),
-                        "tool_compute_ml_signals": _truncate_wandb_text(
-                            current_observations.get("tool_compute_ml_signals", ""),
-                            limit=800,
-                        ),
-                        "tool_check_last_week_pnl": _truncate_wandb_text(
-                            current_observations.get("tool_check_last_week_pnl", ""),
-                            limit=400,
-                        ),
-                        "tool_get_industry_top_news": _truncate_wandb_text(
-                            current_observations.get("tool_get_industry_top_news", ""),
-                            limit=800,
-                        ),
                     },
                     step=len(results) + 1,
                 )
@@ -605,8 +836,14 @@ class WalkForwardEngine:
                 observations=current_observations,
                 agent_decisions=current_agent_decisions,
                 sector_returns=sector_returns,
+                last_error=current_error,
+                market_closed_week=bool(trading_window["market_closed_week"]),
+                trading_day_count=int(trading_window["trading_day_count"]),
+                first_trading_day=str(trading_window["first_trading_day"]),
+                last_trading_day=str(trading_window["last_trading_day"]),
             )
             results.append(record)
+            wandb_trace_rows.append(_result_to_wandb_row(record))
             self._persist_backtest_snapshot(results, run_id=run_id, as_of_week=week_start)
             checkpoint_path = self._save_checkpoint(
                 run_id=run_id,
@@ -630,7 +867,14 @@ class WalkForwardEngine:
         logger.info("Backtest metrics saved to {}", self._backtest_metrics_path(run_id))
         wandb_handler = WandbRegistry.get("backtest")
         if wandb_handler is not None:
-            wandb_handler.log_summary(metrics)
+            summary_payload = {
+                **metrics,
+                "latest_total_value": float(portfolio.total_value),
+                "latest_weekly_return": float(last_week_return),
+                "latest_cash_weight": float(portfolio.cash_weight),
+            }
+            wandb_handler.log_summary(summary_payload)
+            wandb_handler.log_table_rows("backtest/weekly_trace", wandb_trace_rows, step=len(wandb_trace_rows))
             wandb_handler.log_artifact(
                 self._backtest_results_path(run_id),
                 name=f"{run_id}_backtest_results",
@@ -645,6 +889,12 @@ class WalkForwardEngine:
             )
         logger.info("=" * 60)
         logger.info("Backtest Results run_id={}", run_id)
+        logger.info(
+            "  trading_weeks: {} / {} (market_closed_weeks={})",
+            int(metrics.get("weeks", 0)) - int(metrics.get("market_closed_weeks", 0)),
+            int(metrics.get("weeks", 0)),
+            int(metrics.get("market_closed_weeks", 0)),
+        )
         for k, v in metrics.items():
             logger.info("  {}: {}", k, v)
         logger.info("=" * 60)

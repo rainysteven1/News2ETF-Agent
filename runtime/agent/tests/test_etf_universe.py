@@ -155,3 +155,39 @@ def test_get_etf_candidates_only_returns_real_price_universe_codes(tmp_path: Pat
     assert "512480.SH 半导体ETF" in out
     assert "588000.SH" not in out
     assert "159999.SZ" not in out
+
+
+def test_get_etf_candidates_accepts_meta_sector_name(tmp_path: Path) -> None:
+    etf_info_path, etf_prices_path = _write_test_universe(tmp_path)
+    config = SimpleNamespace(
+        data=SimpleNamespace(
+            etf_info=etf_info_path,
+            etf_prices=etf_prices_path,
+            industry_dict=tmp_path / "industry_dict.json",
+        )
+    )
+
+    with patch("src.config.load_config", return_value=config), patch("src.agent.tools.IndustryMapper", _FakeIndustryMapper):
+        out = get_etf_candidates.invoke({"industry": "科技信息", "date": "2024-01-08"})
+
+    assert "512480.SH 半导体ETF" in out
+
+
+def test_get_etf_candidates_accepts_meta_sector_mapping(tmp_path: Path) -> None:
+    etf_info_path, etf_prices_path = _write_test_universe(tmp_path)
+    config = SimpleNamespace(
+        data=SimpleNamespace(
+            etf_info=etf_info_path,
+            etf_prices=etf_prices_path,
+            industry_dict=tmp_path / "industry_dict.json",
+        )
+    )
+
+    with (
+        patch("src.config.load_config", return_value=config),
+        patch("src.agent.tools.IndustryMapper", _FakeIndustryMapper),
+        patch("src.agent.tools.meta_to_subs", return_value=["半导体/芯片"]),
+    ):
+        out = get_etf_candidates.invoke({"industry": "科技成长", "date": "2024-01-08"})
+
+    assert "512480.SH 半导体ETF" in out

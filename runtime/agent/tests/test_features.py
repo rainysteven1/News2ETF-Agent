@@ -256,6 +256,22 @@ class TestBuildTCNSequence:
         for sector, values in result.items():
             assert len(values) == lookback, f"{sector} has {len(values)} values, expected {lookback}"
 
+    def test_accepts_date_typed_sentiment_dates(
+        self,
+        mock_sentiment_df: pl.DataFrame,
+        mock_meta_sector_map: dict[str, Any],
+    ) -> None:
+        """Polars Date columns should not break string date filters."""
+        builder = AgentFeatureBuilder(
+            sentiment_df=mock_sentiment_df.with_columns(pl.col("date").str.strptime(pl.Date, "%Y-%m-%d"))
+        )
+        builder._meta_sector_map = mock_meta_sector_map
+
+        result = builder.build_tcn_sequence(date="2024-09-30", lookback=5)
+
+        assert "科技成长" in result
+        assert len(result["科技成长"]) == 5
+
 
 class TestBuildNewsSummary:
     """Tests for build_news_summary()."""

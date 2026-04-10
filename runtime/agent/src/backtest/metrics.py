@@ -16,6 +16,7 @@ class Metrics(BaseModel):
     calmar_ratio: float
     win_rate: float
     weeks: int
+    market_closed_weeks: int
     final_nav: float
     initial_capital: float
 
@@ -43,6 +44,7 @@ def calculate_metrics(
             calmar_ratio=0.0,
             win_rate=0.0,
             weeks=0,
+            market_closed_weeks=0,
             final_nav=0.0,
             initial_capital=0.0,
         )
@@ -56,6 +58,9 @@ def calculate_metrics(
 
     # Annualized return (52 weeks/year)
     n_weeks = len(nav_series)
+    market_closed_weeks = (
+        int(backtest_df["market_closed_week"].cast(pl.Int64).sum()) if "market_closed_week" in backtest_df.columns else 0
+    )
     n_years = n_weeks / 52
     annual_return = (1 + total_return) ** (1 / n_years) - 1 if n_years > 0 else 0.0
 
@@ -95,6 +100,7 @@ def calculate_metrics(
         calmar_ratio=float(calmar_ratio),
         win_rate=win_rate,
         weeks=int(n_weeks),
+        market_closed_weeks=market_closed_weeks,
         final_nav=float(nav_series[-1]),
         initial_capital=initial_capital,
     )

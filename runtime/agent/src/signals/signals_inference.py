@@ -14,10 +14,10 @@ from typing import Any
 import numpy as np
 import polars as pl
 
-from trainer.src.datasets.signals import (
-    _get_market_cap_weight,
+from src.signals.signal_helpers import (
     build_sub_category_sequences,
     compute_global_leader_sentiment,
+    get_market_cap_weight,
 )
 
 
@@ -193,7 +193,7 @@ class SignalsONNXInferencePipeline:
                 if day_df.is_empty():
                     continue
                 weights = np.array(
-                    [_get_market_cap_weight(sub, self.meta_sector_map) for sub in day_df[sector_col].to_list()],
+                    [get_market_cap_weight(sub, self.meta_sector_map) for sub in day_df[sector_col].to_list()],
                     dtype=np.float32,
                 )
                 sentiments = np.array(day_df[sent_col].to_list(), dtype=np.float32)

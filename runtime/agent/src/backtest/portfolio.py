@@ -70,6 +70,52 @@ class Portfolio:
         missing = [sector for sector in active_sectors if not self.selected_etfs.get(sector)]
         return len(active_sectors), len(active_sectors) - len(missing), missing
 
+    def repair_selected_etfs_from_price_map(
+        self,
+        etf_prices: pl.DataFrame,
+        week_start: str,
+        sector_etf_code_map: dict[str, list[str]],
+    ) -> list[str]:
+        """Recover or normalize selected ETF codes using tradable weekly price data."""
+        week_start_dt = datetime.strptime(week_start, "%Y-%m-%d")
+        next_week_int = int((week_start_dt + timedelta(days=7)).strftime("%Y%m%d"))
+        week_start_int = int(week_start_dt.strftime("%Y%m%d"))
+        week_df = etf_prices.filter((pl.col("trade_dt") >= week_start_int) & (pl.col("trade_dt") < next_week_int))
+        prev_day_df = etf_prices.filter(pl.col("trade_dt") < week_start_int)
+        if len(week_df) == 0 or len(prev_day_df) == 0:
+            return []
+
+        last_day = week_df["trade_dt"].max()
+        prev_last = prev_day_df["trade_dt"].max()
+        if last_day is None or prev_last is None:
+            return []
+
+        last_prices = week_df.filter(pl.col("trade_dt") == last_day).rename({"close": "close_curr"})
+        prev_prices = etf_prices.filter(pl.col("trade_dt") == prev_last).rename({"close": "close_prev"})
+        merged = last_prices.join(prev_prices, on="Code", how="inner")
+        if len(merged) == 0:
+            return []
+
+        available_codes = set(merged["Code"].to_list())
+        repaired: list[str] = []
+        for sector in sorted(self.holdings):
+            existing_raw = self.selected_etfs.get(sector, "")
+            resolved_existing = self._resolve_price_code(existing_raw, available_codes)
+            if resolved_existing:
+                if existing_raw != resolved_existing:
+                    self.selected_etfs[sector] = resolved_existing
+                    repaired.append(f"{sector}->{resolved_existing}")
+                continue
+
+            for code in sector_etf_code_map.get(sector, []):
+                resolved = self._resolve_price_code(code, available_codes)
+                if not resolved:
+                    continue
+                self.selected_etfs[sector] = resolved
+                repaired.append(f"{sector}->{resolved}")
+                break
+        return repaired
+
     def repair_missing_selected_etfs(
         self,
         *,
@@ -241,6 +287,7 @@ class Portfolio:
         Returns:
             (total_return, sector_contributions, sector_returns)
         """
+        self.repair_selected_etfs_from_price_map(etf_prices, week_start, sector_etf_code_map)
         diagnostics = self.inspect_price_availability(etf_prices, week_start)
         missing_selected_etfs = diagnostics["missing_selected_etfs"]
         missing_price_sectors = diagnostics["missing_price_sectors"]
@@ -289,7 +336,10 @@ class Portfolio:
                 for resolved in (self._resolve_price_code(code, available_codes) for code in sector_etf_code_map.get(sector, []))
                 if resolved
             ]
-            etf_codes = [resolved_selected] if resolved_selected else fallback_codes
+            if not resolved_selected and fallback_codes:
+                resolved_selected = fallback_codes[0]
+                self.selected_etfs[sector] = resolved_selected
+            etf_codes = [resolved_selected] if resolved_selected else []
             etf_rets = merged.filter(pl.col("Code").cast(pl.Utf8).is_in(etf_codes))["etf_return"].to_list()
             if etf_rets:
                 sector_return = sum(etf_rets) / len(etf_rets)
@@ -336,6 +386,11 @@ class Portfolio:
         observations: dict | None = None,
         agent_decisions: list[dict] | None = None,
         sector_returns: dict[str, float] | None = None,
+        last_error: str = "",
+        market_closed_week: bool = False,
+        trading_day_count: int = 0,
+        first_trading_day: str = "",
+        last_trading_day: str = "",
     ) -> dict:
         """记录本周状态，供 Agent 后续复盘（行为记忆）。
 
@@ -347,7 +402,12 @@ class Portfolio:
             "week_start": week_start,
             "initial_capital": self.initial_capital,
             "nav": self.total_value,
+            "total_value": self.total_value,
             "weekly_return": weekly_return,
+            "market_closed_week": market_closed_week,
+            "trading_day_count": int(trading_day_count),
+            "first_trading_day": first_trading_day,
+            "last_trading_day": last_trading_day,
             "invested_weight": self.invested_weight,
             "cash_weight": self.cash_weight,
             "holdings": self.holdings.copy(),
@@ -359,6 +419,7 @@ class Portfolio:
             "cumulative_return": (self.total_value - self.initial_capital) / self.initial_capital,
             "observations": observations or {},
             "agent_decisions": agent_decisions or [],
+            "last_error": last_error,
         }
 
     def snapshot(self) -> dict[str, Any]:

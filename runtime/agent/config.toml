@@ -1,5 +1,10 @@
 seed = 42
 
+[wandb]
+mode = "online"
+project = "News2ETF-Agent"
+entity = "rainysteven_team"
+
 [agent]
 llm_model = "Minimax-M2.7-highspeed"
 llm_temperature = 0.0
@@ -21,7 +26,3 @@ max_cache_weeks = 4
 [memos]
 api_key = "YOUR_API_KEY"
 base_url = "https://memos.memtensor.cn/api/openmem/v1"
-
-[wandb]
-mode = "disabled"
-project = "news2etf-agent"

@@ -4,6 +4,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import main
+import pytest
 from src.logger import get_logger, init_logger, logger
 
 
@@ -64,3 +65,99 @@ def test_backtest_defaults_log_path_to_checkpoint_run_dir(monkeypatch, tmp_path:
     assert captured["engine_run_id"] == "bt_test_logger"
     assert captured["engine_checkpoint_dir"] == tmp_path / "checkpoints"
     assert captured["log_path"] == tmp_path / "checkpoints" / "bt_test_logger" / "backtest.log"
+
+
+def test_backtest_preflight_reports_missing_sentiment_dataset(tmp_path: Path) -> None:
+    cfg = SimpleNamespace(
+        data=SimpleNamespace(
+            output_agent_features_oof=tmp_path / "missing.oof.parquet",
+            output_agent_features=tmp_path / "missing.parquet",
+            output_sentiment=tmp_path / "missing_sentiment.parquet",
+        ),
+        predict=SimpleNamespace(signals_onnx_dir=tmp_path / "bundle"),
+    )
+
+    with pytest.raises(FileNotFoundError, match="signals sentiment dataset"):
+        main._validate_backtest_inputs(cfg)
+
+
+def test_backtest_preflight_accepts_existing_sentiment_and_bundle(tmp_path: Path) -> None:
+    sentiment_path = tmp_path / "sentiment.parquet"
+    bundle_dir = tmp_path / "bundle"
+    sentiment_path.write_text("ok", encoding="utf-8")
+    bundle_dir.mkdir()
+
+    cfg = SimpleNamespace(
+        data=SimpleNamespace(
+            output_agent_features_oof=tmp_path / "missing.oof.parquet",
+            output_agent_features=tmp_path / "missing.parquet",
+            output_sentiment=sentiment_path,
+        ),
+        predict=SimpleNamespace(signals_onnx_dir=bundle_dir),
+    )
+
+    main._validate_backtest_inputs(cfg)
+
+
+def test_init_src_resumes_wandb_from_run_meta(monkeypatch, tmp_path: Path) -> None:
+    captured: dict[str, object] = {}
+    logs: list[tuple[object, ...]] = []
+
+    class DummyCfg:
+        seed = 42
+
+        def model_dump(self, mode: str = "json") -> dict[str, object]:
+            assert mode == "json"
+            return {"seed": 42}
+
+    class DummyHandler:
+        def metadata(self) -> dict[str, object]:
+            return {
+                "wandb_run_id": "wandb-123",
+                "wandb_run_name": "bt_test",
+                "project": "demo",
+                "entity": "demo-team",
+                "mode": "online",
+                "tags": ["backtest"],
+            }
+
+    run_dir = tmp_path / "checkpoints" / "bt_test"
+    run_dir.mkdir(parents=True)
+    (run_dir / "run_meta.json").write_text(
+        '{"wandb_run_id":"wandb-123","wandb_run_name":"bt_test","project":"demo","entity":"demo-team","mode":"online","created_at":"2026-04-10T00:00:00+00:00"}',
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(main, "_ROOT", tmp_path)
+    monkeypatch.setattr(main, "init_config", lambda path: None)
+    monkeypatch.setattr(main, "init_logger", lambda path: None)
+    monkeypatch.setattr(main, "get_config", lambda: DummyCfg())
+    monkeypatch.setattr(main, "_init_seed", lambda seed: None)
+    monkeypatch.setattr(main, "init_runtime", lambda **kwargs: None)
+    monkeypatch.setattr(main.logger, "info", lambda *args: logs.append(args))
+    monkeypatch.setattr(
+        main.WandbRegistry,
+        "init",
+        lambda key, **kwargs: captured.update({"key": key, **kwargs}),
+    )
+    monkeypatch.setattr(main.WandbRegistry, "get", lambda key: DummyHandler())
+
+    main._init_src(
+        None,
+        None,
+        run_id="bt_test",
+        checkpoint_dir=tmp_path / "checkpoints",
+        init_wandb=True,
+        wandb_tags=["backtest"],
+    )
+
+    assert captured["key"] == "backtest"
+    assert captured["existing_run_id"] == "wandb-123"
+    assert captured["resume"] == "must"
+
+    payload = main._load_run_meta(tmp_path / "checkpoints", "bt_test")
+    assert payload["wandb_run_id"] == "wandb-123"
+    assert payload["run_id"] == "bt_test"
+    assert payload["created_at"] == "2026-04-10T00:00:00+00:00"
+    assert isinstance(payload["updated_at"], str)
+    assert any("Resuming W&B run" in str(item[0]) for item in logs)

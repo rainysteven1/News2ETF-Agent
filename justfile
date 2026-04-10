@@ -2,6 +2,9 @@ set dotenv-load := true
 set dotenv-filename := ".env"
 
 root := justfile_directory()
+docker_image := "news2etf-agent"
+docker_backtest_script := "runtime/agent/scripts/docker_backtest.sh"
+docker_run := "bash " + docker_backtest_script + " --image " + docker_image + " --skip-build"
 
 # ── Dev environment ──────────────────────────────────────────────────────────────
 
@@ -67,7 +70,41 @@ signals-infer-2024:
 
 # Run weekly backtest with the agent consuming only 2024 inference outputs
 backtest-2024:
-    python runtime/agent/main.py backtest --start-date 2024-01-01 --end-date 2024-12-31
+    ./.venv/bin/python runtime/agent/main.py backtest --start-date 2024-01-01 --end-date 2024-12-31
+
+# Inspect whether runtime-local model and sentiment artifacts are in place
+runtime-check-artifacts:
+    @echo "runtime artifact check"
+    @{ [ -e runtime/agent/data/inputs/sentiment_weekly.parquet ] && echo "  REQ  runtime/agent/data/inputs/sentiment_weekly.parquet" || echo "  MISS runtime/agent/data/inputs/sentiment_weekly.parquet"; \
+       [ -e runtime/agent/models/signals/final-3y/manifest.json ] && echo "  REQ  runtime/agent/models/signals/final-3y/manifest.json" || echo "  MISS runtime/agent/models/signals/final-3y/manifest.json"; \
+       [ -e runtime/agent/models/major/best.onnx ] && echo "  OPT  runtime/agent/models/major/best.onnx" || echo "  OPT  runtime/agent/models/major/best.onnx (missing, only needed for raw news ONNX labeling)"; \
+       [ -e runtime/agent/models/sub/0407-1415 ] && echo "  OPT  runtime/agent/models/sub/0407-1415" || echo "  OPT  runtime/agent/models/sub/0407-1415 (missing, only needed for raw news ONNX labeling)"; \
+       [ -e runtime/agent/data/inputs/sentiment_weekly.parquet ] && [ -e runtime/agent/models/signals/final-3y/manifest.json ]; }
+
+# One-shot helper to copy legacy trainer artifacts into runtime/agent
+runtime-migrate-artifacts:
+    @echo "migrating runtime artifacts"
+    @mkdir -p runtime/agent/data/inputs runtime/agent/models/major runtime/agent/models/sub/0407-1415 runtime/agent/models/signals/final-3y
+    @if [ -f trainer/data/labeled/signals/sentiment_weekly.parquet ]; then echo "  REQ  trainer/data/labeled/signals/sentiment_weekly.parquet -> runtime/agent/data/inputs/sentiment_weekly.parquet"; cp trainer/data/labeled/signals/sentiment_weekly.parquet runtime/agent/data/inputs/sentiment_weekly.parquet; else echo "  MISS trainer/data/labeled/signals/sentiment_weekly.parquet -> runtime/agent/data/inputs/sentiment_weekly.parquet"; fi
+    @if [ -d trainer/models/signals/final-3y ]; then echo "  REQ  trainer/models/signals/final-3y -> runtime/agent/models/signals/final-3y"; cp -R trainer/models/signals/final-3y/. runtime/agent/models/signals/final-3y/; else echo "  MISS trainer/models/signals/final-3y -> runtime/agent/models/signals/final-3y"; fi
+    @if [ -d trainer/models/major ]; then echo "  OPT  trainer/models/major -> runtime/agent/models/major"; cp -R trainer/models/major/. runtime/agent/models/major/; else echo "  OPT  trainer/models/major -> runtime/agent/models/major (missing, only needed for raw news ONNX labeling)"; fi
+    @if [ -d trainer/models/sub/0407-1415 ]; then echo "  OPT  trainer/models/sub/0407-1415 -> runtime/agent/models/sub/0407-1415"; cp -R trainer/models/sub/0407-1415/. runtime/agent/models/sub/0407-1415/; else echo "  OPT  trainer/models/sub/0407-1415 -> runtime/agent/models/sub/0407-1415 (missing, only needed for raw news ONNX labeling)"; fi
+
+# Build the runtime-oriented Docker image
+docker-build-runtime: runtime-check-artifacts
+    docker build --network host -f runtime/agent/Dockerfile -t {{ docker_image }} .
+
+# Run a Docker backtest for any date range
+docker-backtest start_date end_date:
+    {{ docker_run }} --start-date {{ start_date }} --end-date {{ end_date }}
+
+# Run a Docker backtest for any date range with an explicit run_id
+docker-backtest-run run_id start_date end_date:
+    {{ docker_run }} --run-id {{ run_id }} --start-date {{ start_date }} --end-date {{ end_date }}
+
+# Run the 2024 backtest inside Docker using an already-built image
+docker-backtest-2024:
+    {{ docker_run }} --start-date 2024-01-01 --end-date 2024-12-31
 
 # Recommended one-pass order for a 4-year dataset:
 #   1) Evaluate the development split: just signals-train-dev-2y1y
@@ -76,6 +113,12 @@ backtest-2024:
 #   4) Export the final ONNX bundle: just signals-export-onnx-final-3y
 #   5) Export pure 2024 inference features: just signals-infer-2024
 #   6) Run the agent backtest on 2024: just backtest-2024
+#   7) Build the runtime image: just docker-build-runtime
+#   8) Run a custom Docker backtest: just docker-backtest 2024-01-01 2024-12-31
+#   9) Run a Docker backtest with an explicit run_id: just docker-backtest-run bt_demo 2024-01-01 2024-12-31
+#  10) Run the full 2024 Docker backtest: just docker-backtest-2024
+
+# Run the local 2024 signal-to-backtest pipeline end-to-end
 signals-agent-pipeline-2024: signals-train-final-3y signals-export-onnx-final-3y signals-infer-2024 backtest-2024
 
 # Major defaults are taken from trainer/config.toml:

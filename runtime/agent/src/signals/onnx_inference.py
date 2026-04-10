@@ -15,7 +15,7 @@ import numpy as np
 import polars as pl
 
 from src.logger import logger
-from trainer.src.config.utils import LabelStats, safe_name
+from src.signals.label_stats import LabelStats, safe_name
 
 if TYPE_CHECKING:
     from src.config import AgentRootConfig

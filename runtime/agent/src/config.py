@@ -112,6 +112,14 @@ def trainer_root() -> Path:
     return repo_root() / "trainer"
 
 
+def runtime_inputs_root() -> Path:
+    return runtime_root() / "data" / "inputs"
+
+
+def runtime_models_root() -> Path:
+    return runtime_root() / "models"
+
+
 def best_etf_by_index_path(etf_info_path: str | Path | None = None) -> Path:
     if etf_info_path is not None:
         path = Path(etf_info_path)
@@ -163,7 +171,8 @@ def _apply_defaults(raw: dict[str, Any], root: Path) -> dict[str, Any]:
     normalized = dict(raw)
     runtime = runtime_root()
     shared_data = shared_data_root()
-    trainer = trainer_root()
+    runtime_inputs = runtime_inputs_root()
+    runtime_models = runtime_models_root()
     normalized.setdefault("seed", 42)
     normalized.setdefault("agent", {})
     normalized.setdefault("backtest", {})
@@ -177,16 +186,16 @@ def _apply_defaults(raw: dict[str, Any], root: Path) -> dict[str, Any]:
     normalized["data"].setdefault("etf_prices", str(shared_data / "converted" / "主题ETF历史量价.parquet"))
     normalized["data"].setdefault("industry_dict", str(shared_data / "industry_dict.json"))
     normalized["data"].setdefault("meta_sector_mapping", str(shared_data / "meta_sector_mapping.json"))
-    normalized["data"].setdefault("output_sentiment", str(runtime / "data" / "industry_sentiment.parquet"))
+    normalized["data"].setdefault("output_sentiment", str(runtime_inputs / "sentiment_weekly.parquet"))
     normalized["data"].setdefault("output_logs", str(runtime / "data" / "decision_logs.jsonl"))
     normalized["data"].setdefault("output_backtest", str(runtime / "data" / "backtest_results.parquet"))
     normalized["data"].setdefault("output_backtest_metrics", str(runtime / "data" / "backtest_metrics.parquet"))
-    normalized["data"].setdefault("output_agent_features", str(runtime / "data" / "agent_features.parquet"))
-    normalized["data"].setdefault("output_agent_features_oof", str(runtime / "data" / "agent_features.oof.parquet"))
+    normalized["data"].setdefault("output_agent_features", str(shared_data / "agent_features.parquet"))
+    normalized["data"].setdefault("output_agent_features_oof", str(shared_data / "agent_features.oof.parquet"))
 
-    normalized["predict"].setdefault("finbert_onnx_dir", str(trainer / "models" / "major"))
-    normalized["predict"].setdefault("setfit_base_dir", str(trainer / "models" / "sub" / "0407-1415"))
-    normalized["predict"].setdefault("signals_onnx_dir", str(trainer / "models" / "signals" / "final-3y"))
+    normalized["predict"].setdefault("finbert_onnx_dir", str(runtime_models / "major"))
+    normalized["predict"].setdefault("setfit_base_dir", str(runtime_models / "sub" / "0407-1415"))
+    normalized["predict"].setdefault("signals_onnx_dir", str(runtime_models / "signals" / "final-3y"))
     normalized["predict"].setdefault("onnx_cache_dir", str(runtime / "data" / "onnx_cache"))
 
     normalized["data"] = _resolve_nested_path_fields(normalized["data"], root)

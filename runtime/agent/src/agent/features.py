@@ -69,6 +69,13 @@ class AgentFeatureBuilder:
         self._mapper = None
         self._meta_sector_etf_codes = None
 
+    def _ensure_string_date_column(self, df: pl.DataFrame, column: str = "date") -> pl.DataFrame:
+        if len(df) == 0 or column not in df.columns:
+            return df
+        if df.schema.get(column) == pl.Utf8:
+            return df
+        return df.with_columns(pl.col(column).cast(pl.Utf8))
+
     def _coerce_path(self, value: Any) -> Path | None:
         if isinstance(value, Path):
             return value
@@ -85,6 +92,7 @@ class AgentFeatureBuilder:
                 self._sentiment_df = pl.read_parquet(path)
             else:
                 self._sentiment_df = pl.DataFrame()
+        self._sentiment_df = self._ensure_string_date_column(self._sentiment_df)
         return self._sentiment_df
 
     @property
@@ -291,8 +299,7 @@ class AgentFeatureBuilder:
                     logger.warning(f"[AgentFeatureBuilder] Failed to auto-build agent_features.parquet: {exc}")
             if path and path.exists():
                 self._agent_feature_df = pl.read_parquet(path)
-                if "date" in self._agent_feature_df.columns:
-                    self._agent_feature_df = self._agent_feature_df.with_columns(pl.col("date").cast(pl.Utf8))
+                self._agent_feature_df = self._ensure_string_date_column(self._agent_feature_df)
             else:
                 self._agent_feature_df = pl.DataFrame()
         return self._agent_feature_df

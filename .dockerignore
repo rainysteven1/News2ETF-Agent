@@ -1,0 +1,29 @@
+.git
+.gitignore
+.idea
+.vscode
+.venv
+.pytest_cache
+.mypy_cache
+.ruff_cache
+.cache
+__pycache__/
+*.py[cod]
+*.so
+
+# Local runtime outputs should be mounted, not baked into the image.
+runtime/agent/checkpoints/
+runtime/agent/data/
+runtime/agent/wandb/
+runtime/agent/__pycache__/
+runtime/agent/tests/
+
+# Repo data and trainer artifacts are mounted at runtime.
+data/
+trainer/
+
+# Misc local clutter
+temp/
+logs/
+output/
+node_modules/

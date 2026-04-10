@@ -19,6 +19,12 @@ def test_load_config_resolves_data_and_predict_paths() -> None:
     assert cfg.data.input_news_raw.is_absolute()
     assert cfg.data.output_backtest.is_absolute()
     assert cfg.predict.signals_onnx_dir.is_absolute()
+    assert cfg.data.output_sentiment == runtime_root() / "data" / "inputs" / "sentiment_weekly.parquet"
+    assert cfg.data.output_agent_features == repo_root() / "data" / "agent_features.parquet"
+    assert cfg.data.output_agent_features_oof == repo_root() / "data" / "agent_features.oof.parquet"
+    assert cfg.predict.finbert_onnx_dir == runtime_root() / "models" / "major"
+    assert cfg.predict.setfit_base_dir == runtime_root() / "models" / "sub" / "0407-1415"
+    assert cfg.predict.signals_onnx_dir == runtime_root() / "models" / "signals" / "final-3y"
 
 
 def test_init_config_sets_singleton_instance() -> None:

@@ -19,6 +19,7 @@ from src.agent.memos_retrieval import MemosRetrieval
 from src.runtime import get_runtime
 from src.utils.etf_universe import get_etf_universe
 from src.utils.industry_map import IndustryMapper
+from src.utils.meta_sector_map import meta_to_subs
 from src.utils.news_loader import load_raw_news_df
 
 
@@ -436,14 +437,35 @@ def get_etf_candidates(industry: str, date: str = "") -> str:
             all_small_cats.append((large_cat, small_cat))
 
     matched_large = None
-    for large_cat, small_cat in all_small_cats:
-        if small_cat == industry or small_cat in industry:
-            matched_large = large_cat
-            break
+    search_groups: list[tuple[str, str]] = []
+
+    if industry in mapper.get_large_cats():
+        matched_large = industry
+        search_groups = [(industry, small_cat) for small_cat in mapper.get_small_cats(industry)]
+    else:
+        # Accept meta-sector inputs such as "医药健康" even when the ETF universe
+        # still uses legacy large-category labels.
+        for sub in meta_to_subs(industry):
+            for large_cat, small_cat in all_small_cats:
+                if small_cat != sub:
+                    continue
+                matched_large = large_cat
+                if (large_cat, small_cat) not in search_groups:
+                    search_groups.append((large_cat, small_cat))
+
+    if not search_groups:
+        for large_cat, small_cat in all_small_cats:
+            if small_cat == industry or small_cat in industry or industry in small_cat:
+                matched_large = large_cat
+                search_groups = [(large_cat, small_cat)]
+                break
     if matched_large is None:
         return f"Industry not found: {industry}"
 
-    indices = mapper.get_indices(matched_large, industry)
+    indices: list[str] = []
+    for large_cat, small_cat in search_groups:
+        indices.extend(mapper.get_indices(large_cat, small_cat))
+    indices = list(dict.fromkeys(indices))
     if not indices:
         return f"No tracking indices for industry: {industry}"
 
