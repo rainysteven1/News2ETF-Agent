@@ -95,7 +95,8 @@ class WandbHandler:
         self._run_id = self._run.id if self._run is not None else None
 
     def log_metrics(self, metrics: dict[str, Any], step: int | None = None) -> None:
-        wandb.log(metrics, step=step)
+        del step
+        wandb.log(metrics)
 
     def log_summary(self, metrics: dict[str, Any]) -> None:
         if self._run is not None:

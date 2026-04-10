@@ -47,8 +47,8 @@ class SetFitDataConfig(BaseModel):
 
 
 class SetFitModelConfig(BaseModel):
-    pretrained_model: str = "./trainer/data/pretrained_models/mengzi-bert-base-fin"
-    label_stats: str = "./trainer/data/labeled/setfit/label_stats.json"
+    pretrained_model: Path | str = "./trainer/data/pretrained_models/mengzi-bert-base-fin"
+    label_stats: Path | str = "./trainer/data/labeled/setfit/label_stats.json"
     max_seq_length: int = 128
 
     def to_wandb(self) -> dict[str, Any]:
@@ -106,7 +106,7 @@ class SupervisedDataConfig(BaseModel):
 
 
 class SupervisedModelConfig(BaseModel):
-    pretrained_model: str = "bert-base-chinese"
+    pretrained_model: Path | str = "bert-base-chinese"
     dropout: float = 0.1
 
     def to_wandb(self) -> dict[str, Any]:

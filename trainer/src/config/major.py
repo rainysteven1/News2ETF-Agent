@@ -23,7 +23,7 @@ class MajorDataConfig(BaseModel):
 
 
 class MajorModelConfig(BaseModel):
-    pretrained_model: str = "bert-base-chinese"
+    pretrained_model: Path | str = "bert-base-chinese"
     num_level1: int = 8
     num_sentiment: int = 3
     max_seq_length: int = 128

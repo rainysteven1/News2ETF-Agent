@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel
 
@@ -28,6 +28,7 @@ class SignalsTrainingConfig(BaseModel):
     num_heads: int = 4
     anomaly_threshold: float = 0.03
     output_checkpoint: Path | None = None
+    deploy_onnx_dir: Path | None = None
 
 
 # ─── IsolationForest ───────────────────────────────────────────────────────────
@@ -56,6 +57,11 @@ class SignalsDatasetConfig(BaseModel):
     train_end_week: str = "2021-01-03"
     freq: str = "weekly"
     cross_industry: bool = True
+    forecast_days: int = 5
+    target_mode: Literal["meta_excess_return", "meta_return", "meta_sentiment"] = "meta_excess_return"
+    label_stats_path: Path | None = None
+    walk_forward_enabled: bool = True
+    walk_forward_min_train_years: int = 2
 
 
 # ─── OHLCV ───────────────────────────────────────────────────────────────────

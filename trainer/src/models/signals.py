@@ -5,11 +5,13 @@ TCN uses stacked 1D dilated convolutions with causal padding to preserve tempora
 
 from __future__ import annotations
 
+import warnings
 from pathlib import Path
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.jit import TracerWarning
 
 
 class TemporalBlock(nn.Module):
@@ -136,20 +138,22 @@ def export_tcn_to_onnx(
     dummy = torch.randn(1, seq_len, input_size)
 
     onnx_path.parent.mkdir(parents=True, exist_ok=True)
-    torch.onnx.export(
-        wrapper,
-        (dummy,),
-        onnx_path.as_posix(),
-        export_params=True,
-        opset_version=opset_version,
-        input_names=["input"],
-        output_names=["reg_output", "cls_output"],
-        dynamic_axes={
-            "input": {0: "batch_size", 1: "seq_len"},
-            "reg_output": {0: "batch_size"},
-            "cls_output": {0: "batch_size"},
-        },
-    )
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", category=TracerWarning)
+        torch.onnx.export(
+            wrapper,
+            (dummy,),
+            onnx_path.as_posix(),
+            export_params=True,
+            opset_version=opset_version,
+            input_names=["input"],
+            output_names=["reg_output", "cls_output"],
+            dynamic_axes={
+                "input": {0: "batch_size", 1: "seq_len"},
+                "reg_output": {0: "batch_size"},
+                "cls_output": {0: "batch_size"},
+            },
+        )
 
 
 class SpatialDropout(nn.Module):
@@ -189,6 +193,9 @@ class TCNFanIn(nn.Module):
         spatial_dropout_p=0.3,
     ):
         super().__init__()
+        self.n_sub = n_sub
+        self.n_meta = n_meta
+        self.input_size = input_size
         self.spatial_dropout = SpatialDropout(p=spatial_dropout_p)
         self.spatial_mlp = nn.Sequential(
             nn.Linear(n_sub * input_size, 128),
@@ -213,7 +220,7 @@ class TCNFanIn(nn.Module):
         self.cls_head = nn.Sequential(
             nn.Linear(hidden_size, hidden_size // 2),
             nn.ReLU(),
-            nn.Linear(hidden_size // 2, 1),
+            nn.Linear(hidden_size // 2, n_meta),
         )
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -235,24 +242,30 @@ def export_tcn_fanin_to_onnx(
     model: TCNFanIn,
     onnx_path: Path,
     seq_len: int = 5,
-    n_sub: int = 47,
-    input_size: int = 6,
+    n_sub: int | None = None,
+    input_size: int | None = None,
     opset_version: int = 14,
 ) -> None:
     model.eval()
+    if n_sub is None:
+        n_sub = model.n_sub
+    if input_size is None:
+        input_size = model.input_size
     dummy = torch.randn(1, seq_len, n_sub, input_size)
     onnx_path.parent.mkdir(parents=True, exist_ok=True)
-    torch.onnx.export(
-        model,
-        (dummy,),
-        onnx_path.as_posix(),
-        export_params=True,
-        opset_version=opset_version,
-        input_names=["input"],
-        output_names=["reg_output", "cls_output"],
-        dynamic_axes={
-            "input": {0: "batch_size"},
-            "reg_output": {0: "batch_size"},
-            "cls_output": {0: "batch_size"},
-        },
-    )
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", category=TracerWarning)
+        torch.onnx.export(
+            model,
+            (dummy,),
+            onnx_path.as_posix(),
+            export_params=True,
+            opset_version=opset_version,
+            input_names=["input"],
+            output_names=["reg_output", "cls_output"],
+            dynamic_axes={
+                "input": {0: "batch_size"},
+                "reg_output": {0: "batch_size"},
+                "cls_output": {0: "batch_size"},
+            },
+        )

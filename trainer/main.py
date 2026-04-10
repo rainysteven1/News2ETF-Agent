@@ -11,6 +11,10 @@ Usage:
     python -m trainer.main sub supervised train [majors...]
     python -m trainer.main sub supervised export-onnx --model-path ... --onnx-path ...
 
+    python -m trainer.main signals train
+    python -m trainer.main signals export-onnx --checkpoint-dir ... --bundle-dir ...
+    python -m trainer.main signals infer --bundle-dir ...
+
     python -m trainer.main predict all
     python -m trainer.main predict major
     python -m trainer.main predict sub --sub-shard-workers 4 --sub-major-workers 8
@@ -317,6 +321,44 @@ def signals_train(
     from trainer.src.pipelines.train_signals import run_training
 
     run_training(force=force)
+
+
+@signals_app.command("infer")
+@with_trainer_init(init_wandb=False)
+def signals_infer(
+    ctx: typer.Context,
+    bundle_dir: str | None = typer.Option(None, "--bundle-dir", help="Signals ONNX bundle directory."),
+    output_path: str | None = typer.Option(None, "--output-path", "-o", help="Output parquet path."),
+    start_date: str | None = typer.Option(None, "--start-date", help="Inclusive YYYY-MM-DD."),
+    end_date: str | None = typer.Option(None, "--end-date", help="Inclusive YYYY-MM-DD."),
+    force_dataset: bool = typer.Option(False, "--force-dataset", help="Rebuild cached sentiment dataset first."),
+) -> None:
+    """Run explicit signals inference from the deployed ONNX bundle."""
+    from trainer.src.pipelines.infer_signals import run_inference
+
+    run_inference(
+        bundle_dir=Path(bundle_dir) if bundle_dir else None,
+        output_path=Path(output_path) if output_path else None,
+        start_date=start_date,
+        end_date=end_date,
+        force_dataset=force_dataset,
+    )
+
+
+@signals_app.command("export-onnx")
+@with_trainer_init(init_wandb=False)
+def signals_export_onnx(
+    ctx: typer.Context,
+    checkpoint_dir: str = typer.Option(..., "--checkpoint-dir", "-i", help="Signals checkpoint directory."),
+    bundle_dir: str | None = typer.Option(None, "--bundle-dir", "-o", help="Target ONNX bundle directory."),
+) -> None:
+    """Export a trained signals checkpoint to an ONNX deployment bundle."""
+    from trainer.src.pipelines.train_signals import export_signals_onnx_bundle_from_checkpoint
+
+    export_signals_onnx_bundle_from_checkpoint(
+        checkpoint_dir=Path(checkpoint_dir),
+        bundle_dir=Path(bundle_dir) if bundle_dir else None,
+    )
 
 
 # ── Register subapps ──────────────────────────────────────────────────────────

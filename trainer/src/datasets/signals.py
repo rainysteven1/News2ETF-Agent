@@ -16,6 +16,7 @@ from pathlib import Path
 import numpy as np
 import polars as pl
 import torch
+from loguru import logger
 
 from trainer.src.config.signals import SignalsDatasetConfig
 
@@ -53,6 +54,124 @@ GLOBAL_LEADER_BASKET: dict[str, float] = {
     "TLT": 0.15,
 }
 
+
+def load_signal_subcategories_from_label_stats(
+    label_stats_path: str | Path | None = None,
+) -> list[str] | None:
+    """Load canonical signal sub-category order from data/label_stats.json."""
+    if label_stats_path is None:
+        label_stats_path = Path(__file__).resolve().parent.parent.parent.parent / "data" / "label_stats.json"
+    path = Path(label_stats_path)
+    if not path.exists():
+        return None
+
+    with open(path, encoding="utf-8") as f:
+        payload = json.load(f)
+
+    by_sub_category = payload.get("by_sub_category", {})
+    ordered: list[str] = []
+    for full_name in by_sub_category.keys():
+        if " / " in full_name:
+            _, sub_name = full_name.split(" / ", 1)
+        else:
+            sub_name = full_name
+        if sub_name not in ordered:
+            ordered.append(sub_name)
+    return ordered
+
+
+def _candidate_signal_monthly_checkpoint_dirs(raw_path: Path) -> list[Path]:
+    return [
+        raw_path.parent / f".{raw_path.stem}_monthly_checkpoints",
+        raw_path.parent / raw_path.stem / f".{raw_path.stem}_sub_monthly_checkpoints",
+    ]
+
+
+def _parse_month_key(path: Path) -> datetime:
+    return datetime.strptime(path.stem, "%Y-%m")
+
+
+def _next_month(dt: datetime) -> datetime:
+    if dt.month == 12:
+        return dt.replace(year=dt.year + 1, month=1)
+    return dt.replace(month=dt.month + 1)
+
+
+def resolve_signal_monthly_checkpoint_dir(raw_path: str | Path) -> Path:
+    raw_path = Path(raw_path)
+    candidates = [p for p in _candidate_signal_monthly_checkpoint_dirs(raw_path) if p.exists() and p.is_dir()]
+    if not candidates:
+        checked = ", ".join(str(p) for p in _candidate_signal_monthly_checkpoint_dirs(raw_path))
+        raise FileNotFoundError(
+            f"No monthly raw checkpoint directory found for {raw_path}. Checked: {checked}"
+        )
+    if len(candidates) > 1:
+        joined = ", ".join(str(p) for p in candidates)
+        raise RuntimeError(f"Multiple monthly raw checkpoint directories found for {raw_path}: {joined}")
+    return candidates[0]
+
+
+def validate_signal_monthly_checkpoints(
+    raw_path: str | Path,
+    *,
+    checkpoint_dir: str | Path | None = None,
+) -> list[Path]:
+    raw_path = Path(raw_path)
+    resolved_dir = Path(checkpoint_dir) if checkpoint_dir is not None else resolve_signal_monthly_checkpoint_dir(raw_path)
+    month_paths = sorted(resolved_dir.glob("*.parquet"), key=_parse_month_key)
+    if not month_paths:
+        raise FileNotFoundError(f"No monthly parquet files found under {resolved_dir}")
+
+    unreadable: list[str] = []
+    gaps: list[str] = []
+    expected = _parse_month_key(month_paths[0])
+    for path in month_paths:
+        current = _parse_month_key(path)
+        if current.year != expected.year or current.month != expected.month:
+            gaps.append(f"expected {expected:%Y-%m}, got {current:%Y-%m}")
+            expected = current
+        try:
+            pl.read_parquet(path, n_rows=8)
+        except Exception as exc:
+            unreadable.append(f"{path.stem}: {type(exc).__name__}: {exc}")
+        expected = _next_month(expected)
+
+    issues: list[str] = []
+    if gaps:
+        issues.append("Non-contiguous months: " + "; ".join(gaps))
+    if unreadable:
+        issues.append("Unreadable parquet files: " + "; ".join(unreadable))
+    if issues:
+        for issue in issues:
+            logger.error(f"[Signals] Monthly raw checkpoint validation error | dir={resolved_dir} | {issue}")
+        raise RuntimeError(
+            f"Monthly raw checkpoints validation failed under {resolved_dir}. " + " | ".join(issues)
+        )
+
+    logger.info(
+        f"[Signals] Validated monthly raw checkpoints: dir={resolved_dir} | files={len(month_paths)}"
+        f" | range={month_paths[0].stem} -> {month_paths[-1].stem}"
+    )
+    return month_paths
+
+
+def rebuild_signal_raw_from_monthly_checkpoints(
+    raw_path: str | Path,
+    *,
+    checkpoint_dir: str | Path | None = None,
+) -> Path:
+    raw_path = Path(raw_path)
+    month_paths = validate_signal_monthly_checkpoints(raw_path, checkpoint_dir=checkpoint_dir)
+    frames = [pl.read_parquet(path) for path in month_paths]
+    merged = pl.concat(frames, how="vertical_relaxed")
+    raw_path.parent.mkdir(parents=True, exist_ok=True)
+    merged.write_parquet(raw_path)
+    logger.info(
+        f"[Signals] Rebuilt raw parquet from monthly checkpoints: output={raw_path}"
+        f" | rows={len(merged)} | files={len(month_paths)}"
+    )
+    return raw_path
+
 # ─── OHLCV Aggregation ─────────────────────────────────────────────────────────
 
 
@@ -87,12 +206,13 @@ def build_ohlcv_by_industry(
     with open(industry_dict_path, encoding="utf-8") as f:
         industry_dict = json.load(f)
 
-    industry_etf_codes: dict[str, list[str]] = {}  # industry → codes
+    industry_etf_codes: dict[str, list[str]] = {}  # sub_category → codes
     for major, subs in industry_dict.items():
-        for sub_data in subs.values():
+        del major
+        for sub_name, sub_data in subs.items():
             for idx_name in sub_data.get("indices", []):
                 if idx_name in index_to_codes:
-                    industry_etf_codes.setdefault(major, []).extend(index_to_codes[idx_name])
+                    industry_etf_codes.setdefault(sub_name, []).extend(index_to_codes[idx_name])
 
     # Deduplicate
     for k in industry_etf_codes:
@@ -140,6 +260,7 @@ class WeeklySignalDataset:
     ):
         assert cfg.raw_data_path is not None, "raw_data_path must be set"
         self.raw_path = Path(cfg.raw_data_path)
+        self._ensure_raw_source()
         self.output_sentiment = Path(cfg.output_sentiment) if cfg.output_sentiment else None
         self.train_end_week = datetime.fromisoformat(cfg.train_end_week)
         self.freq = cfg.freq  # "weekly" or "daily"
@@ -151,7 +272,9 @@ class WeeklySignalDataset:
         self.ohlcv_df: pl.DataFrame | None = None
 
         # Cache logic: if processed file exists and not forced, load directly
-        if self.output_sentiment and self.output_sentiment.exists() and not force:
+        if self.output_sentiment and self.output_sentiment.exists() and not force and self._is_cache_compatible(
+            self.output_sentiment
+        ):
             self._load_cached(self.output_sentiment)
         else:
             self._load_raw()
@@ -159,6 +282,22 @@ class WeeklySignalDataset:
                 self._save_cached(self.output_sentiment)
                 # Reload so sentiment_df matches the saved unpivoted format
                 self._load_cached(self.output_sentiment)
+
+    def _cache_industry_col(self) -> str:
+        assert self.lf is not None, "Raw lazy frame not loaded"
+        schema_names = set(self.lf.collect_schema().names())
+        return "sub_category" if "sub_category" in schema_names else "major_category"
+
+    def _is_cache_compatible(self, path: Path) -> bool:
+        try:
+            df = pl.read_parquet(path, columns=["industry"], n_rows=256)
+        except Exception:
+            return False
+        cached = set(df["industry"].drop_nulls().unique().to_list())
+        canonical = load_signal_subcategories_from_label_stats()
+        if canonical:
+            return len(cached.intersection(canonical)) > 0
+        return True
 
     def _load_cached(self, path: Path) -> None:
         """Load pre-aggregated parquet (may include OHLCV columns if present)."""
@@ -169,7 +308,8 @@ class WeeklySignalDataset:
 
     def _save_cached(self, path: Path) -> None:
         """Save aggregated data as unpivoted parquet for reuse (sentiment + volume + OHLCV)."""
-        self._ensure_weekly("major_category")
+        industry_col = self._cache_industry_col()
+        self._ensure_weekly(industry_col)
         assert self.sentiment_df is not None and self.volume_df is not None
 
         sent_long = self.sentiment_df.unpivot(index="period", variable_name="industry", value_name="sentiment_mean")
@@ -242,14 +382,28 @@ class WeeklySignalDataset:
 
         # Ensure return column exists (0 if no OHLCV data)
         if "return" not in merged.columns:
-            merged = merged.with_columns(pl.lit(0.0).alias("return"))
+                merged = merged.with_columns(pl.lit(0.0).alias("return"))
 
         merged.write_parquet(path)
 
+    def _ensure_raw_source(self) -> None:
+        if self.raw_path.exists():
+            return
+        checkpoint_dir = resolve_signal_monthly_checkpoint_dir(self.raw_path)
+        logger.info(
+            f"[Signals] raw parquet missing, rebuilding from monthly checkpoints under {checkpoint_dir}"
+        )
+        rebuild_signal_raw_from_monthly_checkpoints(self.raw_path, checkpoint_dir=checkpoint_dir)
+
     def _load_raw(self) -> None:
         df = pl.read_parquet(self.raw_path)
+        datetime_dtype = df.schema.get("datetime")
+        if datetime_dtype in (pl.Datetime, pl.Date):
+            datetime_expr = pl.col("datetime").cast(pl.Datetime)
+        else:
+            datetime_expr = pl.col("datetime").cast(pl.Utf8).str.to_datetime()
         df = df.with_columns(
-            pl.col("datetime").str.to_datetime(),
+            datetime_expr.alias("datetime"),
             pl.col("sentiment").replace(self.SENTIMENT_MAP).cast(pl.Float64).alias("sentiment_score"),
         )
         df = df.with_columns(
@@ -712,6 +866,8 @@ def build_sub_category_sequences(
     lookback_days: int = 5,
     forecast_days: int = 5,
     price_df: pl.DataFrame | None = None,
+    label_stats_path: str | Path | None = None,
+    target_mode: str = "meta_excess_return",
 ) -> tuple[np.ndarray, np.ndarray, list, list[str]]:
     """构建扇入式 TCN 训练数据。
 
@@ -727,7 +883,13 @@ def build_sub_category_sequences(
     sent_col = "sentiment_mean" if "sentiment_mean" in df.columns else "sentiment_weighted"
     std_col = "sentiment_std" if "sentiment_std" in df.columns else None
     dates = df["date"].unique().sort().to_list()
-    sub_industries = sorted(df[sector_col].unique().to_list())
+    canonical_subs = load_signal_subcategories_from_label_stats(label_stats_path)
+    observed_subs = set(df[sector_col].drop_nulls().unique().to_list())
+    if canonical_subs:
+        sub_industries = canonical_subs
+        df = df.filter(pl.col(sector_col).is_in(sub_industries))
+    else:
+        sub_industries = sorted(observed_subs)
     meta_sectors = list(meta_sector_map.get("meta_sectors", {}).keys())
 
     if len(dates) <= lookback_days + forecast_days:
@@ -780,9 +942,13 @@ def build_sub_category_sequences(
             sub_category=row[sector_col],
         )
 
+    price_source = price_df
+    if (price_source is None or price_source.is_empty()) and "close" in df.columns:
+        price_source = df.select(["date", sector_col, "close"]).rename({sector_col: "sub_category"})
+
     price_matrix = None
-    if price_df is not None and not price_df.is_empty() and "close" in price_df.columns:
-        price_df = price_df.sort("date")
+    if price_source is not None and not price_source.is_empty() and "close" in price_source.columns:
+        price_df = price_source.sort("date")
         price_sector_col = "sub_category" if "sub_category" in price_df.columns else "industry"
         price_matrix = np.zeros((n_dates, n_sub), dtype=np.float32)
         price_date_to_idx = {d: idx for idx, d in enumerate(dates)}
@@ -858,15 +1024,40 @@ def build_sub_category_sequences(
         sample_dates.append(dates[current_idx])
 
         future_idx = current_idx + forecast_days
-        cur_meta = np.zeros(n_meta, dtype=np.float32)
-        future_meta = np.zeros(n_meta, dtype=np.float32)
-        for m_idx in range(n_meta):
-            weights = meta_weights[m_idx]
-            denom = float(weights.sum())
-            if denom > 0:
-                cur_meta[m_idx] = float((sent_matrix[current_idx] * weights).sum() / denom)
-                future_meta[m_idx] = float((sent_matrix[future_idx] * weights).sum() / denom)
-        raw_targets.append((future_meta - cur_meta) / (np.abs(cur_meta) + 1e-9))
+        if price_matrix is not None and target_mode in {"meta_excess_return", "meta_return"}:
+            valid_now = np.abs(price_matrix[current_idx]) > 1e-9
+            valid_future = np.abs(price_matrix[future_idx]) > 1e-9
+            valid_mask = valid_now & valid_future
+            sub_returns = np.zeros(n_sub, dtype=np.float32)
+            if np.any(valid_mask):
+                sub_returns[valid_mask] = (
+                    (price_matrix[future_idx, valid_mask] - price_matrix[current_idx, valid_mask])
+                    / (price_matrix[current_idx, valid_mask] + 1e-9)
+                )
+            benchmark = float(np.mean(sub_returns[valid_mask])) if np.any(valid_mask) else 0.0
+            target = np.zeros(n_meta, dtype=np.float32)
+            for m_idx in range(n_meta):
+                weights = meta_weights[m_idx]
+                sector_valid = valid_mask & (weights > 0)
+                if np.any(sector_valid):
+                    sector_weights = weights[sector_valid]
+                    sector_return = float(np.average(sub_returns[sector_valid], weights=sector_weights))
+                else:
+                    sector_return = 0.0
+                target[m_idx] = (
+                    sector_return - benchmark if target_mode == "meta_excess_return" else sector_return
+                )
+            raw_targets.append(target)
+        else:
+            cur_meta = np.zeros(n_meta, dtype=np.float32)
+            future_meta = np.zeros(n_meta, dtype=np.float32)
+            for m_idx in range(n_meta):
+                weights = meta_weights[m_idx]
+                denom = float(weights.sum())
+                if denom > 0:
+                    cur_meta[m_idx] = float((sent_matrix[current_idx] * weights).sum() / denom)
+                    future_meta[m_idx] = float((sent_matrix[future_idx] * weights).sum() / denom)
+            raw_targets.append((future_meta - cur_meta) / (np.abs(cur_meta) + 1e-9))
 
     if not sequences:
         return np.array([], dtype=np.float32), np.array([], dtype=np.float32), [], sub_industries
@@ -875,9 +1066,9 @@ def build_sub_category_sequences(
     flat = raw_target_matrix.reshape(-1)
     p1, p99 = np.percentile(flat, 1), np.percentile(flat, 99)
     clipped = np.clip(raw_target_matrix, p1, p99)
-    mu = float(clipped.mean())
+    # Keep zero-centered semantics: a raw target of 0 should remain 0 after scaling.
     sigma = float(clipped.std()) + 1e-9
-    y = np.tanh((clipped - mu) / sigma).astype(np.float32)
+    y = np.tanh(clipped / sigma).astype(np.float32)
 
     X = np.stack(sequences).astype(np.float32)
     return X, y, sample_dates, sub_industries
@@ -1130,18 +1321,24 @@ def export_phase2_dataset(
     iforest_model,
     device: torch.device,
     output_path: Path,
-) -> None:
+    lookback_days: int = 5,
+    label_stats_path: str | Path | None = None,
+) -> pl.DataFrame:
     """导出每日特征用于 Phase 2 Agent 训练（向量化批量推理）。
 
     只导出训练和推理时都可用的字段，不导出任何依赖未来标签的特征。
     """
     # Build sub-category sequences
     X_all, _, dates, sub_industries = build_sub_category_sequences(
-        sentiment_df, meta_sector_map, lookback_days=5, price_df=price_df
+        sentiment_df,
+        meta_sector_map,
+        lookback_days=lookback_days,
+        price_df=price_df,
+        label_stats_path=label_stats_path,
     )
 
     if len(X_all) == 0:
-        return
+        return pl.DataFrame()
 
     # Batch TCN inference
     with torch.no_grad():
@@ -1226,3 +1423,4 @@ def export_phase2_dataset(
     feature_df = pl.DataFrame(feature_rows)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     feature_df.write_parquet(output_path)
+    return feature_df

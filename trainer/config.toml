@@ -93,10 +93,10 @@ focal_loss_gamma = 2.0
 save_checkpoint = true
 
 [signals.tcn]
-sequence_length = 5
+sequence_length = 10
 hidden_size = 16
 num_layers = 1
-dropout = 0.4
+dropout = 0.25
 
 [signals.isolation_forest]
 contamination = 0.1
@@ -104,15 +104,20 @@ n_estimators = 100
 
 [signals.lightgbm]
 num_leaves = 7
-learning_rate = 0.02
-n_estimators = 500
+learning_rate = 0.03
+n_estimators = 200
 
 [signals.dataset]
 raw_data_path = "./trainer/data/labeled/signals/raw.parquet"
 output_sentiment = "./trainer/data/labeled/signals/sentiment_weekly.parquet"
-train_end_week = "2021-01-03"
+train_end_week = "2023-12-31"
+walk_forward_enabled = true
+walk_forward_min_train_years = 2
 freq = "daily"
 cross_industry = true
+forecast_days = 5
+target_mode = "meta_excess_return"
+label_stats_path = "./data/label_stats.json"
 
 [signals.ohlcv]
 ohlcv_path = "./data/converted/主题ETF历史量价.parquet"
@@ -127,6 +132,7 @@ lr = 0.001
 num_heads = 4
 anomaly_threshold = 0.03
 output_checkpoint = "./trainer/checkpoints/signals"
+deploy_onnx_dir = "./trainer/models/signals/latest"
 
 [predict]
 # Set to true when the machine has a usable accelerator visible to PyTorch,
@@ -154,11 +160,11 @@ major_batch_size = 256
 #   - writes final labeled parquet shards into output_dir
 #   - uses sub_batch_size
 sub_onnx_dir = "./trainer/models/sub/0407-1415"
-sub_shard_workers = 4
-sub_major_workers = 8
+sub_shard_workers = 1
+sub_major_workers = 2
 sub_input_dir = "./trainer/data/labeled/signals/major_only"
 sub_input_glob = "raw.parquet"
 output_dir = "./trainer/data/labeled/signals/raw"
 sub_batch_size = 256
 major_max_length = 128
-sub_max_length = 256
+sub_max_length = 128

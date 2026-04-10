@@ -95,3 +95,6 @@ exclude = [ #
     "**/.*",
     "alembic/versions/*_auto.py",
 ]
+
+[tool.pytest.ini_options]
+testpaths = ["runtime/agent/tests", "trainer/tests"]

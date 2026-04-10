@@ -1,0 +1,27 @@
+seed = 42
+
+[agent]
+llm_model = "Minimax-M2.7-highspeed"
+llm_temperature = 0.0
+enable_history_retrieval = false
+max_weight_per_industry = 0.3
+max_total_weight = 1.0
+
+[backtest]
+initial_capital = 1_000_000.0
+transaction_fee = 0.0003
+slippage = 0.0005
+risk_free_rate = 0.03
+
+[predict]
+finbert_max_length = 128
+setfit_max_length = 256
+max_cache_weeks = 4
+
+[memos]
+api_key = "YOUR_API_KEY"
+base_url = "https://memos.memtensor.cn/api/openmem/v1"
+
+[wandb]
+mode = "disabled"
+project = "news2etf-agent"

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Any, Literal
 
@@ -83,10 +84,15 @@ def init_config(app: Literal["major", "sub", "signals", "predict"], config_path:
     """Initialize the singleton config from a TOML config file."""
     global _config_instance
     if config_path is None:
-        root_dir = Path(__file__).resolve().parent.parent.parent
-        cfg_path = root_dir / "config.toml"
+        env_path = os.getenv("TRAINER_CONFIG_PATH")
+        if env_path:
+            cfg_path = Path(env_path)
+        else:
+            root_dir = Path(__file__).resolve().parent.parent.parent
+            cfg_path = root_dir / "config.toml"
     else:
         cfg_path = Path(config_path)
+    cfg_path = cfg_path.resolve()
 
     import tomllib
 
@@ -117,8 +123,12 @@ def load_config(path: str | Path | None = None) -> RootConfig:
     import tomllib
 
     if path is None:
-        path = Path(__file__).resolve().parent.parent.parent / "config.toml"
-    path = Path(path)
+        env_path = os.getenv("TRAINER_CONFIG_PATH")
+        if env_path:
+            path = Path(env_path)
+        else:
+            path = Path(__file__).resolve().parent.parent.parent / "config.toml"
+    path = Path(path).resolve()
 
     with open(path, "rb") as f:
         raw: dict[str, Any] = tomllib.load(f)
@@ -140,24 +150,42 @@ def _resolve_path_fields(section: dict[str, Any], root: Path) -> dict[str, Any]:
     return resolved
 
 
+def _looks_like_relative_path(value: str) -> bool:
+    return value.startswith("./") or value.startswith("../")
+
+
+def _resolve_nested_path_fields(section: dict[str, Any], root: Path) -> dict[str, Any]:
+    resolved: dict[str, Any] = {}
+    for key, val in section.items():
+        if isinstance(val, dict):
+            resolved[key] = _resolve_nested_path_fields(val, root)
+        elif isinstance(val, list) and key.endswith("_paths"):
+            resolved[key] = [root / item if isinstance(item, str) and _looks_like_relative_path(item) else item for item in val]
+        elif isinstance(val, str) and (
+            key.endswith("_path")
+            or key.endswith("_dir")
+            or key.endswith("_file")
+            or key.endswith("_checkpoint")
+            or key in {"output_sentiment"}
+            or (key in {"pretrained_model", "label_stats"} and _looks_like_relative_path(val))
+        ):
+            resolved[key] = root / val
+        else:
+            resolved[key] = val
+    return resolved
+
+
 def _build_root_config(raw: dict[str, Any], root: Path) -> RootConfig:
     filtered: dict[str, Any] = {}
 
     if "wandb" in raw:
         filtered["wandb"] = raw["wandb"]
     if "major" in raw:
-        filtered["major"] = raw["major"]
+        filtered["major"] = _resolve_nested_path_fields(raw["major"], root.parent)
     if "sub" in raw:
-        filtered["sub"] = raw["sub"]
+        filtered["sub"] = _resolve_nested_path_fields(raw["sub"], root.parent)
     if "signals" in raw:
-        signals_section = dict(raw["signals"])
-        if "dataset" in signals_section:
-            signals_section["dataset"] = _resolve_path_fields(signals_section["dataset"], root.parent)
-        if "training" in signals_section:
-            signals_section["training"] = _resolve_path_fields(signals_section["training"], root.parent)
-        if "ohlcv" in signals_section:
-            signals_section["ohlcv"] = _resolve_path_fields(signals_section["ohlcv"], root.parent)
-        filtered["signals"] = signals_section
+        filtered["signals"] = _resolve_nested_path_fields(raw["signals"], root.parent)
     if "predict" in raw:
         filtered["prediction"] = _resolve_path_fields(raw["predict"], root.parent)
 

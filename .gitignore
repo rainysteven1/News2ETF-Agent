@@ -17,6 +17,8 @@ wheels/
 .claude/
 .vscode/
 
+trainer/.*.toml
+
 assets/
 checkpoints/
 data/

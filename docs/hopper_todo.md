@@ -1,201 +1,186 @@
-# `docs/hopper.md` 修订 TODO
+# `docs/hopper.md` / Signals-Agent 收敛 TODO
 
-这份 TODO 只针对当前 reviewer 提出的文档规格缺口，目标是把 `docs/hopper.md` 从“方向正确”补到“实现可落地、训练和推理一致、验收可执行”。
+这份 TODO 不再围绕旧的 reviewer 文档缺口，而是直接服务当前主目标：
 
----
-
-## P0：本轮必须修
-
-### 1. 明确定义 `event_type_score`
-
-- 在 TCN 输入规格中补充 `ch4` 的确定性计算方式。
-- 明确事件类型枚举、映射规则、聚合窗口、归一化方式。
-- 禁止保留“统计值或 embedding score”这种二选一表述，必须收敛成单一定义。
-
-完成标准：
-
-- 训练侧和推理侧都能按同一公式实现。
-- 不同开发者不会得出不同版本的 `ch4`。
+```text
+signals train
+  -> 导出可部署 ONNX bundle
+signals infer
+  -> 用固定 bundle 对历史 / 测试 / 未来日期做推理
+agent
+  -> 消费推理结果 + Memos + 新闻 + 市场/持仓上下文
+backtest
+  -> 只验证 Agent 基于这些在线可得上下文的决策表现
+```
 
 ---
 
-### 2. 明确定义 `sentiment_vs_price_residual`
+## P0：本轮必须落地
 
-- 补充 `ch5` 的数学定义。
-- 明确情感序列和价格序列的时间对齐方式。
-- 明确是否使用 lag，例如 `sentiment[t-k:t]` 对 `return[t]` 还是 `return[t+1]`。
-- 明确 residual 是来自线性回归、rolling baseline，还是标准化偏差。
+### 1. `signals train` 导出可部署 bundle
 
-完成标准：
+- [x] 导出 `tcn.onnx`
+- [x] 尝试导出逐板块 `lgbm/*.onnx`
+- [x] 尝试导出 `iforest.onnx`
+- [x] 写出 `manifest.json`
+- [x] 支持固定部署目录 `trainer/models/signals/latest`
 
-- 该特征不存在“新闻当天、价格次日”导致的实现歧义。
-- 离线训练和在线推理在同一时点得到一致值。
+当前实现：
 
----
-
-### 3. 冻结 `tcn_prediction_stability` 的算法
-
-- 在 LightGBM 特征章节中把 `[6] tcn_prediction_stability` 写成固定计算公式。
-- 明确回看窗口长度，例如近 3 天或近 5 天。
-- 明确它到底衡量什么：预测波动、方向一致性，还是置信代理。
-- 明确输入仅允许使用历史 `tcn_reg`，不得混入真实未来收益。
-
-完成标准：
-
-- `trainer` 与 `agent` 使用完全相同的实现逻辑。
-- 文档中不再出现“例如”这种开放式说明。
+- 训练结束后会导出 ONNX bundle
+- 目录由 `signals.training.deploy_onnx_dir` 控制
 
 ---
 
-### 4. 明确定义 `global_leader_sentiment`
+### 2. 增加显式 `signals infer`
 
-- 指定数据源范围：全球领导市场/指数/ETF/新闻源到底是谁。
-- 指定刷新时点、时区基准、日切规则。
-- 说明 A 股/本地交易时点如何读取该特征。
-- 说明盘后数据是否进入次日特征。
+- [x] 增加 `python -m trainer.main signals infer`
+- [x] 支持 `--bundle-dir`
+- [x] 支持 `--output-path`
+- [x] 支持 `--start-date / --end-date`
+- [x] 用 ONNX bundle 生成 `agent_features.parquet`
 
-完成标准：
+当前实现：
 
-- 同一交易日不会因读取时间不同而得到不同特征值。
-- 特征定义满足可复现和可回测。
-
----
-
-### 5. 强化 Phase 1 验收标准
-
-- 将“能跑通”升级为“能跑通且达到最低质量门槛”。
-- 为 TCN 增加最小验收指标，例如验证集 loss、rank IC、方向准确率中的至少一种。
-- 为 LightGBM 增加最小验收指标，例如 AUC、F1、balanced accuracy、PR-AUC 中的至少一种。
-- 为 SHAP 补充验收口径，避免只检查“文件是否生成”。
-
-完成标准：
-
-- Phase 1 结束时可以判断“信号是否可用”，而不是只知道“代码执行成功”。
+- `signals infer` 已挂到 trainer CLI
+- 推理入口为 `src/signals/signals_inference.py`
 
 ---
 
-### 6. 明确 Level 1 / Level 2 / `risk_check_node` 的关系
+### 3. Agent 优先消费 signals 推理产物
 
-- 规定 Level 2 是否只在 Level 1 入选的元板块上运行。
-- 规定 Level 1 是否必须输出全部 8 个元板块，还是允许只输出候选子集。
-- 规定 `risk_check_node` 的介入时点：Level 1 后、Level 2 后，还是两处都介入。
-- 规定风控对计划的修改权限：只能删减、降权，还是允许改标的。
-
-完成标准：
-
-- 决策闭环具备明确的时序与约束关系。
-- 不同实现不会出现 schema 一致但行为不一致的问题。
+- [x] `AgentFeatureBuilder` 优先读取 `agent_features.parquet`
+- [x] 若缓存缺失，优先尝试用 `signals_onnx_dir` 自动生成
+- [x] 增加 `ml_signal_snapshot`
+- [x] `compute_ml_signals` 改为元板块信号口径
 
 ---
 
-### 7. 明确定义 `daily_guardrail`
+### 4. 把多源上下文真正接到 trader prompt
 
-- 补充触发条件、输入信号、阈值口径。
-- 明确执行动作：降权、冻结、禁止开仓、禁止加仓、强制平仓中的哪些允许。
-- 明确冷却期和自动释放规则。
-- 明确它作用于 Level 1、Level 2，还是最终组合层。
-
-完成标准：
-
-- `daily_guardrail` 不再只是“覆盖层”的概念说明，而是可测试的规则模块。
-
----
-
-### 8. 补充 `meta_sector_mapping.json` 的生成与更新机制
-
-- 说明权重是人工维护、规则生成还是数据驱动拟合。
-- 说明更新频率和触发条件。
-- 说明版本管理方式，以及更新后是否需要重训。
-
-完成标准：
-
-- 文档不再只说明“权重来自该文件”，而是说明该文件如何被治理。
+- [x] `build_decision_context` 输出结构化上下文
+- [x] `tools_node` 将 `build_decision_context` 回填到 `state["decision_context"]`
+- [x] trader prompt 增加：
+  - `ml_signal_snapshot`
+  - `historical_memory`
+  - `good_patterns`
+  - `bad_patterns`
 
 ---
 
-## P1：建议本轮一起修
+### 5. Memos / 日志模式作为辅助上下文
 
-### 9. 写清 `news_heat` 和 IForest 的关系
-
-- 明确 LightGBM 的 `[3] news_heat` 是否直接使用 IForest 输出。
-- 如果不是同一变量，给出两个变量各自定义和命名区分。
-- 说明离线训练与在线推理的分布漂移处理方式。
+- [x] `build_decision_context` 注入 PromptManager good/bad patterns
+- [x] 若配置了 Memos API，则同时检索相似历史案例
+- [x] 将这部分统一放入 `historical_memory`
 
 ---
 
-### 10. 弱化或重写 SHAP `70%` 规则
+## P1：下一轮继续收敛
 
-- 不建议把 “TCN 相关特征长期超过 70%” 写成硬阈值。
-- 改成复核信号更合适，例如：
-  - 持续高占比时触发 ablation review
-  - 持续高占比时检查二阶段特征独立贡献
+### 6. 清理 Agent placeholder
 
-完成标准：
+- [x] `_get_sector_price()`
+- [x] `market_state.volume_ratio`
+- [x] `weekly_returns`
+- [x] `agent_perf_1w / agent_perf_4w`
 
-- SHAP 规则是诊断 guardrail，不是假精确的红线。
+说明：
 
----
-
-### 11. 为 dry run 增加 checkpoint
-
-- 不要只定义完整 9 个月 dry run。
-- 增加按月或按双月 checkpoint 的中途检查。
-- 检查内容至少包含：
-  - 产物完整性
-  - 决策覆盖率
-  - guardrail 触发频率
-  - 明显异常日志
+- `AgentFeatureBuilder` 现在会从 ETF 量价、backtest parquet、meta-sector ETF 映射中回填这些字段
+- `agent_features` 缓存优先读 `data/agent_features.oof.parquet`
 
 ---
 
-### 12. 明确旧 `per-industry` 路径的处置策略
+### 7. 让 backtest 完全切到元板块主路径
 
-- 说明是“保留兼容但不再演进”，还是“计划删除”。
-- 如果保留，明确只读边界，避免被误当主路径继续开发。
+- [x] ETF 选择链路从旧 `industry` 口径完全迁移到 `8 元板块 -> Level 2 ETF`
+- [x] 风控和回测报告统一用元板块 schema
 
----
+当前实现：
 
-## P2：建议补边界说明
-
-### 13. 补充仓位管理边界
-
-- 如果 `hopper.md` 不负责组合构建，就明确写出“仓位分配不在本文件定义”。
-- 如果要覆盖，就补充总仓位上限、单 ETF 上限、Level 1 权重到实际持仓的映射规则。
-
----
-
-### 14. 补充交易成本建模边界
-
-- 明确滑点、佣金、冲击成本是否在本阶段范围内。
-- 如果不在本文件中定义，也应指向对应回测文档或后续规格文档。
+- `Portfolio` 持仓改为 `meta_sector -> weight`
+- 同时记录 `selected_etfs`
+- 回测结果新增：
+  - `meta_sector_contributions`
+  - `meta_sector_returns`
 
 ---
 
-### 15. 补充 benchmark 定义
+### 8. walk-forward 从“评估”升级为“正式推理产物”
 
-- 明确 dry run 或回测对比基准是什么。
-- 至少说明是宽基指数、等权元板块组合，还是被动 ETF 组合。
+- [x] 导出 OOF `agent_features`
+- [x] 明确区分 train / val / test / future inference
+- [x] Backtest 默认优先读取 OOF / infer 产物，而不是训练期顺手导出的全历史特征
 
----
+当前实现：
 
-## 可不作为本轮阻塞项
-
-以下问题值得记录，但不必阻塞当前版本收敛：
-
-- `lookahead=5` 的经验依据不充分
-- `winsorize p1/p99` 的参数依据不充分
-- `tanh(z)` 在极端市场下的饱和效应尚未讨论
-- TCN 时序输入与 LightGBM 情感变化率存在信息重叠，但这属于建模 tradeoff，不是规格缺口
-
-建议处理方式：
-
-- 在 `hopper.md` 中标为“待消融验证项”或“后续调参项”，不要伪装成已充分论证的固定结论。
+- `signals train` 导出：
+  - `data/agent_features.parquet`
+  - `data/agent_features.oof.parquet`
+- `signals infer` 默认输出到 `data/agent_features.oof.parquet`
+- Agent 默认优先读取 OOF / infer 特征缓存
 
 ---
 
-## 建议执行顺序
+## P2：建议补强
 
-1. 先修 `event_type_score`、`sentiment_vs_price_residual`、`tcn_prediction_stability`、`global_leader_sentiment`
-2. 再修 Phase 1 验收标准和决策闭环时序
-3. 再补 `daily_guardrail`、`meta_sector_mapping.json` 治理方式
-4. 最后修 SHAP 规则、dry run checkpoint、旧路径处置和边界说明
+### 9. 校验 ONNX 和 Python 推理一致性
+
+- [x] 对 TCN / LGBM / IForest 做数值回归检查
+- [x] 写成脚本或测试，避免训练和推理口径再漂移
+
+当前实现：
+
+- 新增 `scripts/check_signals_onnx_consistency.py`
+- 对参考 `agent_features` 与 ONNX 推理结果的重叠日期做列级数值比对
+- 默认跳过 `lgbm_score_*` 这类训练期未写回的列
+
+### 10. 决策上下文标准化
+
+- [x] `build_decision_context` 同时产出 JSON 与人类可读摘要
+- [x] researcher / trader prompt 统一引用同一份 schema
+
+当前实现：
+
+- `build_decision_context` 输出：
+  - `schema_version`
+  - 结构化 JSON
+  - `human_summary`
+- trader prompt 会优先拼接 `human_summary`
+
+### 11. Agent 侧按日期增量刷新特征缓存
+
+- [x] 不是每次都全量重跑
+- [x] 支持 “只补到某个 date” 的缓存刷新
+
+当前实现：
+
+- `AgentFeatureBuilder._ensure_agent_feature_cache_upto(date)`
+- 若指定日期超出当前缓存最大日期，则只增量补推到该日期
+
+---
+
+## 当前判断
+
+当前主链已经从：
+
+```text
+训练后顺手导出一些历史特征
+```
+
+推进到：
+
+```text
+signals train -> ONNX bundle
+signals infer -> 推理特征
+agent -> 读取推理特征 + Memos + 其他上下文
+```
+
+当前 P1 / P2 已全部落地。
+
+剩下更值得继续做的是：
+
+1. 提升 `signals` 的 walk-forward / OOF 训练严谨度，而不是只补导出
+2. 把 `daily_guardrail` 和日频行为日志里的 placeholder 继续清理掉
+3. 继续强化 backtest 的 ETF 层归因和报告展示
