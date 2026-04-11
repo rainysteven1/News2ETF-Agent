@@ -39,6 +39,7 @@ Run the runtime app directly:
 ./.venv/bin/python runtime/agent/main.py --help
 ./.venv/bin/python runtime/agent/main.py backtest --start-date 2024-01-01 --end-date 2024-12-31
 ./.venv/bin/python runtime/agent/main.py diagnose-backtest --run-id bt_example
+./.venv/bin/python runtime/agent/main.py visualize-backtest --run-id bt_example
 ```
 
 ## Artifact Migration
@@ -229,6 +230,30 @@ By default the runtime app writes to:
 - `runtime/agent/data/backtest_metrics.parquet`
 - `runtime/agent/data/onnx_cache/`
 - `runtime/agent/wandb/`
+
+Backtest runs also write an interactive Plotly dashboard by default:
+
+- `runtime/agent/checkpoints/{run_id}/visualizations/report.html`
+- `runtime/agent/checkpoints/{run_id}/visualizations/summary.json`
+- `runtime/agent/checkpoints/{run_id}/visualizations/*.html`
+- `runtime/agent/checkpoints/{run_id}/visualizations/*.png`
+
+Charts include NAV / total value, weekly returns, drawdown, cash vs invested
+weight, allocation drift, sector contribution, and sector return heatmap when
+the corresponding result columns exist.
+
+Disable automatic visualization for a run with:
+
+```bash
+./.venv/bin/python runtime/agent/main.py backtest --start-date 2024-01-01 --end-date 2024-12-31 --no-visualize
+```
+
+Log standalone visualization PNGs to the existing W&B run stored in
+`runtime/agent/checkpoints/{run_id}/run_meta.json` as `wandb.Image` media with:
+
+```bash
+./.venv/bin/python runtime/agent/main.py visualize-backtest --run-id bt_example --upload-wandb
+```
 
 ## Test Commands
 

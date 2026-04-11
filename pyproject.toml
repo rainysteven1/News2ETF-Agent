@@ -57,6 +57,7 @@ runtime = [
     "wandb>=0.25.1",
     "onnxruntime>=1.19.0",
     "transformers==4.44.0",
+    "plotly>=6.0.0",
 ]
 torch_cpu = ["torch==2.4.0+cpu", "onnxruntime==1.19.0"]
 torch_gpu = ["torch==2.4.0", "setfit>=1.1.3", "onnxruntime-gpu>=1.19.0"]

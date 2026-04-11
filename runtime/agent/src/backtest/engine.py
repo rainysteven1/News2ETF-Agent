@@ -26,6 +26,7 @@ from tqdm import tqdm
 
 from src.backtest.metrics import calculate_metrics
 from src.backtest.portfolio import Portfolio
+from src.backtest.visualization import visualize_backtest
 from src.config import AgentRootConfig, best_etf_by_index_path
 from src.logger import logger
 from src.wandb_handler import WandbRegistry
@@ -508,6 +509,7 @@ class WalkForwardEngine:
         resume_from_week: str | None = None,
         resume_to_week: str | None = None,
         resume_latest: bool = False,
+        auto_visualize: bool | None = None,
     ) -> pl.DataFrame:
         """Run weekly backtest.
 
@@ -865,6 +867,23 @@ class WalkForwardEngine:
         )
         logger.info("Backtest saved to {}", self._backtest_results_path(run_id))
         logger.info("Backtest metrics saved to {}", self._backtest_metrics_path(run_id))
+        visualization_result = None
+        should_visualize = (
+            bool(getattr(self.config.backtest, "auto_visualize", False))
+            if auto_visualize is None
+            else auto_visualize
+        )
+        if should_visualize:
+            try:
+                visualization_result = visualize_backtest(
+                    results_path=self._backtest_results_path(run_id),
+                    metrics_path=self._backtest_metrics_path(run_id),
+                    output_dir=self._checkpoint_run_dir(run_id) / "visualizations",
+                    run_id=run_id,
+                )
+                logger.info("Backtest visualization report saved to {}", visualization_result.report_path)
+            except Exception as exc:
+                logger.warning("Backtest visualization failed for run_id={}: {}", run_id, exc)
         wandb_handler = WandbRegistry.get("backtest")
         if wandb_handler is not None:
             summary_payload = {
@@ -881,6 +900,25 @@ class WalkForwardEngine:
                 artifact_type="dataset",
                 aliases=["latest"],
             )
+            if visualization_result is not None:
+                if hasattr(wandb_handler, "add_tags"):
+                    wandb_handler.add_tags(["visualized"])
+                images = {
+                    f"backtest/visualizations/{path.stem}": path
+                    for path in getattr(visualization_result, "image_paths", [])
+                }
+                captions = {
+                    key: f"{run_id} {path.stem.replace('_', ' ')}"
+                    for key, path in images.items()
+                }
+                wandb_handler.log_images(
+                    images,
+                    captions=captions,
+                    gallery_key="backtest_visualizations",
+                    step=len(wandb_trace_rows),
+                )
+                if hasattr(wandb_handler, "metadata"):
+                    self._update_run_meta(run_id, **wandb_handler.metadata())
             wandb_handler.log_artifact(
                 self._backtest_metrics_path(run_id),
                 name=f"{run_id}_backtest_metrics",

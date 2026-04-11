@@ -113,6 +113,47 @@ class WandbHandler:
         for key, value in metrics.items():
             self._run.summary[key] = value
 
+    def add_tags(self, tags: list[str]) -> None:
+        run_tags = list(getattr(self._run, "tags", []) or []) if self._run is not None else []
+        merged = list(dict.fromkeys([*self._tags, *run_tags, *[str(tag) for tag in tags if tag]]))
+        self._tags = merged
+        if self._run is None:
+            return
+        try:
+            self._run.tags = tuple(merged)
+        except Exception as exc:
+            logger.warning("[Wandb] Failed to update run tags: {}", exc)
+
+    def log_images(
+        self,
+        images: dict[str, str | Path],
+        *,
+        captions: dict[str, str] | None = None,
+        gallery_key: str | None = None,
+        step: int | None = None,
+    ) -> None:
+        if self._run is None or not images:
+            return
+
+        import wandb
+
+        payload: dict[str, Any] = {}
+        gallery: list[Any] = []
+        for key, image_path in images.items():
+            path = Path(image_path)
+            if not path.exists():
+                logger.warning("[Wandb] Image path does not exist: {}", path)
+                continue
+            image = wandb.Image(str(path), caption=(captions or {}).get(key, path.stem))
+            payload[key] = image
+            gallery.append(image)
+
+        if gallery_key and gallery:
+            payload[gallery_key] = gallery
+
+        if payload:
+            self._run.log(payload, step=step)
+
     def log_artifact(
         self,
         artifact_path: str | Path,

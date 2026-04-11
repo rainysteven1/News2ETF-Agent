@@ -161,3 +161,93 @@ def test_init_src_resumes_wandb_from_run_meta(monkeypatch, tmp_path: Path) -> No
     assert payload["created_at"] == "2026-04-10T00:00:00+00:00"
     assert isinstance(payload["updated_at"], str)
     assert any("Resuming W&B run" in str(item[0]) for item in logs)
+
+
+def test_visualize_backtest_upload_resumes_wandb_from_run_meta(monkeypatch, tmp_path: Path) -> None:
+    captured: dict[str, object] = {}
+    image_calls: list[tuple[dict[str, Path], dict[str, str] | None]] = []
+
+    class DummyCfg:
+        data = SimpleNamespace(
+            output_backtest=tmp_path / "unused_results.parquet",
+            output_backtest_metrics=tmp_path / "unused_metrics.parquet",
+        )
+
+        def model_dump(self, mode: str = "json") -> dict[str, object]:
+            assert mode == "json"
+            return {"seed": 42}
+
+    class DummyResult:
+        run_id = "bt_test"
+        output_dir = tmp_path / "checkpoints" / "bt_test" / "visualizations"
+        report_path = output_dir / "report.html"
+        image_paths = [output_dir / "equity_curve.png"]
+
+    class DummyHandler:
+        tags = ["backtest"]
+
+        def add_tags(self, tags: list[str]) -> None:
+            self.tags = list(dict.fromkeys([*self.tags, *tags]))
+
+        def log_images(
+            self,
+            images: dict[str, Path],
+            *,
+            captions: dict[str, str] | None = None,
+            gallery_key: str | None = None,
+            step=None,
+        ) -> None:
+            del gallery_key, step
+            image_calls.append((images, captions))
+
+        def metadata(self) -> dict[str, object]:
+            return {
+                "wandb_run_id": "wandb-123",
+                "wandb_run_name": "bt_test_existing",
+                "project": "demo",
+                "entity": "demo-team",
+                "mode": "online",
+                "tags": list(self.tags),
+            }
+
+    run_dir = tmp_path / "checkpoints" / "bt_test"
+    run_dir.mkdir(parents=True)
+    (run_dir / "run_meta.json").write_text(
+        '{"run_id":"bt_test","wandb_run_id":"wandb-123","wandb_run_name":"bt_test_existing","tags":["backtest"],"latest_total_value":1012345.0,"created_at":"2026-04-10T00:00:00+00:00"}',
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(main, "_ROOT", tmp_path)
+    monkeypatch.setattr(main, "_init_src", lambda *args, **kwargs: None)
+    monkeypatch.setattr(main, "get_config", lambda: DummyCfg())
+    monkeypatch.setattr(main, "visualize_backtest", lambda **kwargs: DummyResult())
+    monkeypatch.setattr(
+        main.WandbRegistry,
+        "init",
+        lambda key, **kwargs: captured.update({"key": key, **kwargs}),
+    )
+    monkeypatch.setattr(main.WandbRegistry, "get", lambda key: DummyHandler())
+    monkeypatch.setattr(main.WandbRegistry, "finish_all", lambda: None)
+
+    main.visualize_backtest_cmd(
+        config=None,
+        run_id="bt_test",
+        results_path=None,
+        metrics_path=None,
+        output_dir=None,
+        upload_wandb=True,
+    )
+
+    assert captured["key"] == "visualize-backtest"
+    assert captured["existing_run_id"] == "wandb-123"
+    assert captured["resume"] == "must"
+    assert captured["run_name"] == "bt_test_existing"
+    assert captured["tags"] == ["backtest", "visualized"]
+    assert image_calls[0][0] == {"backtest/visualizations/equity_curve": DummyResult.image_paths[0]}
+
+    payload = main._load_run_meta(tmp_path / "checkpoints", "bt_test")
+    assert payload["wandb_run_id"] == "wandb-123"
+    assert payload["tags"] == ["backtest", "visualized"]
+    assert payload["latest_total_value"] == 1012345.0
+    assert payload["created_at"] == "2026-04-10T00:00:00+00:00"
+    assert isinstance(payload["updated_at"], str)

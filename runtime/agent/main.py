@@ -25,6 +25,7 @@ from src.agent.state import AgentState
 from src.agent.workflow import build_workflow
 from src.backtest.diagnostics import diagnose_backtest
 from src.backtest.engine import WalkForwardEngine
+from src.backtest.visualization import visualize_backtest
 from src.config import AgentRootConfig, get_config, init_config, runtime_root
 from src.env import load_project_env
 from src.logger import init_logger, logger
@@ -252,6 +253,7 @@ def backtest(
     resume_from_week: Annotated[str | None, typer.Option("--resume-from-week")] = None,
     resume_to_week: Annotated[str | None, typer.Option("--resume-to-week")] = None,
     resume_latest: Annotated[bool, typer.Option("--resume-latest")] = False,
+    visualize: Annotated[bool, typer.Option("--visualize/--no-visualize")] = True,
 ) -> None:
     """Run weekly walk-forward backtest using ReAct agent."""
     if (resume_from_week or resume_latest) and not run_id:
@@ -275,6 +277,7 @@ def backtest(
             ("Resume from", resume_from_week or "N/A"),
             ("Resume to", resume_to_week or "N/A"),
             ("Resume latest", "Yes" if resume_latest else "No"),
+            ("Visualize", "Yes" if visualize else "No"),
         ],
     )
 
@@ -293,6 +296,7 @@ def backtest(
         resume_from_week=resume_from_week,
         resume_to_week=resume_to_week,
         resume_latest=resume_latest,
+        auto_visualize=visualize,
     )
     console.print("[bold green]Backtest complete![/bold green]")
 
@@ -406,6 +410,112 @@ def diagnose_backtest_cmd(
         raise typer.Exit(1 if summary["error_count"] > 0 else 0)
 
     console.print("[bold green]No issues detected.[/bold green]")
+
+
+@app.command("visualize-backtest")
+@with_src_init
+def visualize_backtest_cmd(
+    config: Annotated[Path | None, typer.Option("-c", "--config")] = None,
+    run_id: Annotated[str | None, typer.Option("--run-id")] = None,
+    results_path: Annotated[Path | None, typer.Option("--results-path")] = None,
+    metrics_path: Annotated[Path | None, typer.Option("--metrics-path")] = None,
+    output_dir: Annotated[Path | None, typer.Option("--output-dir")] = None,
+    upload_wandb: Annotated[bool, typer.Option("--upload-wandb/--no-upload-wandb")] = False,
+) -> None:
+    """Generate a local Plotly dashboard from persisted backtest parquet files."""
+    cfg = get_config()
+    if run_id:
+        default_run_dir = _ROOT / "checkpoints" / run_id
+        resolved_results_path = results_path or default_run_dir / "backtest_results.parquet"
+        resolved_metrics_path = metrics_path or default_run_dir / "backtest_metrics.parquet"
+        resolved_output_dir = output_dir or default_run_dir / "visualizations"
+    else:
+        resolved_results_path = results_path or cfg.data.output_backtest
+        resolved_metrics_path = metrics_path or cfg.data.output_backtest_metrics
+        resolved_output_dir = output_dir or _ROOT / "data" / "visualizations" / "backtest"
+
+    console.print("[bold]Backtest Visualization[/bold]")
+    _print_table(
+        "",
+        [
+            ("Run ID", run_id or "N/A"),
+            ("Results", str(resolved_results_path)),
+            ("Metrics", str(resolved_metrics_path)),
+            ("Output", str(resolved_output_dir)),
+            ("Upload W&B", "Yes" if upload_wandb else "No"),
+        ],
+    )
+
+    wandb_key = "visualize-backtest"
+    run_meta: dict[str, object] = {}
+    if upload_wandb:
+        if not run_id:
+            console.print(
+                "[bold red]--upload-wandb requires --run-id so the checkpoint run_meta.json can be used.[/bold red]"
+            )
+            raise typer.Exit(1)
+        checkpoint_dir = _ROOT / "checkpoints"
+        run_meta = _load_run_meta(checkpoint_dir, run_id)
+        existing_wandb_id = str(run_meta.get("wandb_run_id", "") or "") or None
+        if not existing_wandb_id:
+            console.print(
+                "[bold red]No wandb_run_id found in "
+                f"{_run_meta_path(checkpoint_dir, run_id)}. "
+                "Run the backtest with W&B enabled first.[/bold red]"
+            )
+            raise typer.Exit(1)
+        logger.info("Resuming W&B run for visualization upload: run_id={} wandb_run_id={}", run_id, existing_wandb_id)
+        raw_tags = run_meta.get("tags", [])
+        tags = [str(tag) for tag in raw_tags] if isinstance(raw_tags, list) else ["backtest"]
+        tags = list(dict.fromkeys([*(tags or ["backtest"]), "visualized"]))
+        WandbRegistry.init(
+            wandb_key,
+            run_name=str(run_meta.get("wandb_run_name", "") or run_id),
+            cfg_dict=cfg.model_dump(mode="json"),
+            tags=tags or ["backtest"],
+            existing_run_id=existing_wandb_id,
+            resume="must",
+        )
+
+    try:
+        result = visualize_backtest(
+            results_path=resolved_results_path,
+            metrics_path=resolved_metrics_path,
+            output_dir=resolved_output_dir,
+            run_id=run_id,
+        )
+        if upload_wandb:
+            handler = WandbRegistry.get(wandb_key)
+            if handler is not None:
+                handler.add_tags(["visualized"])
+                images = {
+                    f"backtest/visualizations/{path.stem}": path
+                    for path in getattr(result, "image_paths", [])
+                }
+                captions = {
+                    key: f"{result.run_id} {path.stem.replace('_', ' ')}"
+                    for key, path in images.items()
+                }
+                handler.log_images(
+                    images,
+                    captions=captions,
+                    gallery_key="backtest_visualizations",
+                )
+                now = _utc_now_iso()
+                _save_run_meta(
+                    _ROOT / "checkpoints",
+                    run_id,
+                    {
+                        **run_meta,
+                        "run_id": run_id,
+                        "updated_at": now,
+                        **handler.metadata(),
+                    },
+                )
+        console.print(f"[bold green]Visualization saved:[/bold green] {result.report_path}")
+    finally:
+        if upload_wandb:
+            WandbRegistry.finish_all()
 
 
 if __name__ == "__main__":

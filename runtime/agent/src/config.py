@@ -24,6 +24,7 @@ class BacktestConfig(BaseModel):
     slippage: float = 0.0005
     risk_free_rate: float = 0.03
     max_abs_weekly_return_guardrail: float = 0.30
+    auto_visualize: bool = True
 
 
 class DataConfig(BaseModel):

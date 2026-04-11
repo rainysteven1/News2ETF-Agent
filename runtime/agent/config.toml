@@ -17,6 +17,7 @@ initial_capital = 1_000_000.0
 transaction_fee = 0.0003
 slippage = 0.0005
 risk_free_rate = 0.03
+auto_visualize = true
 
 [predict]
 finbert_max_length = 128

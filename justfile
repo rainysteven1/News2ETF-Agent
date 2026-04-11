@@ -22,6 +22,9 @@ decide week:
 backtest start end:
     python runtime/agent/main.py backtest --start-date {{ start }} --end-date {{ end }}
 
+upload-backtest-viz run_id:
+    ./.venv/bin/python runtime/agent/main.py visualize-backtest --run-id {{ run_id }} --upload-wandb
+
 # ── Trainer CLI (trainer/main.py) ──────────────────────────────────────────────
 
 major-train:
