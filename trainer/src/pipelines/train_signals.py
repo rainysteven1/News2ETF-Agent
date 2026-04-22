@@ -877,8 +877,9 @@ def _evaluate_fanin_walk_forward(
 def run_training(force: bool = False) -> dict[str, str]:
     """Primary training entrypoint.
 
-    The maintained path is now the fan-in training pipeline defined in
-    docs/hopper.md. The legacy per-industry pipeline is intentionally bypassed.
+    The maintained path is the fan-in training pipeline described by the
+    current system design spec. The legacy per-industry pipeline is
+    intentionally bypassed.
     """
     try:
         signals_cfg = get_config().signals
